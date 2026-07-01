@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import hashlib
 import asyncio
 import logging
 import threading
@@ -57,6 +58,13 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.shadow_bucket import (
+    ShadowPlacement,
+    bucket_slots_from_kv_cache_tensors,
+    build_shadow_bucket_plan,
+    parse_shadow_buckets,
+)
+
 logger = init_logger(__name__)
 
 try:
@@ -76,6 +84,7 @@ if TYPE_CHECKING:
 
 ReqId = str  # Internal scheduler request ID
 TransferId = str  # KV transfer coordination ID (shared by P/D)
+KVCacheValue = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,11 @@ class TransferRegion:
     base_addr: int
     block_len: int
     kv_block_len: int
+
+@dataclass(frozen=True)
+class KVCacheAddressMetadata:
+    base_addr: int
+    block_len: int
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -150,8 +164,10 @@ def _compute_sender_transfer_plan(
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
 
     if tp_ratio == 1:
-        return True, 0, 0, local_kv_block_len
-
+        # return True, 0, 0, local_kv_block_len
+        transfer_len = min(local_kv_block_len, remote_kv_block_len)
+        return True, 0, 0, remote_kv_block_len
+    
     if tp_ratio > 0:
         if producer_cache_replicated:
             return local_tp_rank % tp_ratio == 0, 0, 0, local_kv_block_len
@@ -190,6 +206,68 @@ def _can_coalesce_block_transfers(
     )
 
 
+def _format_transfer_region_sample(
+    regions: list[TransferRegion], limit: int = 8
+) -> str:
+    sample = [
+        (idx, region.base_addr, region.block_len, region.kv_block_len)
+        for idx, region in enumerate(regions[:limit])
+    ]
+    suffix = "" if len(regions) <= limit else f" ... +{len(regions) - limit} more"
+    return f"count={len(regions)} sample={sample}{suffix}"
+
+
+def _format_transfer_descriptor_sample(
+    src_ptrs: list[int],
+    dst_ptrs: list[int],
+    lengths: list[int],
+    limit: int = 16,
+) -> str:
+    if not src_ptrs or not dst_ptrs or not lengths:
+        return (
+            f"src_count={len(src_ptrs)} dst_count={len(dst_ptrs)} "
+            f"len_count={len(lengths)} total_bytes={sum(lengths)} sample=[]"
+        )
+
+    descriptor_count = min(len(src_ptrs), len(dst_ptrs), len(lengths))
+    sample = [
+        (
+            idx,
+            src_ptr,
+            dst_ptr,
+            length,
+            src_ptr + length,
+            dst_ptr + length,
+        )
+        for idx, (src_ptr, dst_ptr, length) in enumerate(
+            zip(src_ptrs[:limit], dst_ptrs[:limit], lengths[:limit])
+        )
+    ]
+    src_start = min(src_ptrs[:descriptor_count])
+    src_end = max(
+        src_ptr + length
+        for src_ptr, length in zip(
+            src_ptrs[:descriptor_count], lengths[:descriptor_count]
+        )
+    )
+    dst_start = min(dst_ptrs[:descriptor_count])
+    dst_end = max(
+        dst_ptr + length
+        for dst_ptr, length in zip(
+            dst_ptrs[:descriptor_count], lengths[:descriptor_count]
+        )
+    )
+    suffix = (
+        "" if descriptor_count <= limit else f" ... +{descriptor_count - limit} more"
+    )
+    return (
+        f"src_count={len(src_ptrs)} dst_count={len(dst_ptrs)} "
+        f"len_count={len(lengths)} total_bytes={sum(lengths)} "
+        f"src_range=({src_start}, {src_end}) dst_range=({dst_start}, {dst_end}) "
+        f"sample=(idx, src, dst, len, src_end, dst_end) {sample}{suffix}"
+    )
+
+
 def _validate_asymmetric_region_lengths(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
@@ -204,6 +282,21 @@ def _validate_asymmetric_region_lengths(
     for layouts that store K and V together.
     """
     if len(local_regions) != len(remote_regions):
+        # logger.warning(
+        error_message = (
+            "[PD_DEBUG][region_count_mismatch] "
+            "local_count=%d remote_count=%d local_tp_size=%d "
+            "remote_tp_size=%d producer_cache_replicated=%s "
+            "local_regions=%s remote_regions=%s",
+            len(local_regions),
+            len(remote_regions),
+            local_tp_size,
+            remote_tp_size,
+            producer_cache_replicated,
+            [(region.base_addr, region.kv_block_len) for region in local_regions],
+            [(region.base_addr, region.kv_block_len) for region in remote_regions],
+        )
+        logger.warning(error_message)
         return (
             "Mooncake asymmetric TP requires matching KV region counts between "
             "producer and consumer."
@@ -249,6 +342,39 @@ def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     if callable(is_dense):
         return bool(is_dense())
     return None
+
+
+def _get_tensor_storage_key(tensor: torch.Tensor) -> int:
+    try:
+        return tensor.untyped_storage().data_ptr()
+    except (AttributeError, RuntimeError):
+        try:
+            return tensor.storage().data_ptr()
+        except (AttributeError, RuntimeError):
+            return tensor.data_ptr()
+
+
+def _merge_register_ranges(
+    ranges_by_storage: dict[int, list[tuple[int, int]]],
+) -> tuple[list[int], list[int]]:
+    ptrs: list[int] = []
+    lengths: list[int] = []
+    register_merge_gap_bytes = 4096
+
+    for ranges in ranges_by_storage.values():
+        ranges.sort(key=lambda item: item[0])
+        merged_start, merged_end = ranges[0]
+        for start, end in ranges[1:]:
+            if start <= merged_end + register_merge_gap_bytes:
+                merged_end = max(merged_end, end)
+                continue
+            ptrs.append(merged_start)
+            lengths.append(merged_end - merged_start)
+            merged_start, merged_end = start, end
+        ptrs.append(merged_start)
+        lengths.append(merged_end - merged_start)
+
+    return ptrs, lengths
 
 
 class MooncakeXferMetadata(
@@ -745,8 +871,11 @@ class MooncakeConnectorWorker:
 
         self.engine = TransferEngine()
         self.hostname = get_ip()
+        self.shadow_block_len_per_layer: list[int] = []
+        self.shadow_bucket_plan: tuple[ShadowPlacement, ...] = ()
 
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
+        self.kv_role: str = kv_transfer_config.kv_role
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
@@ -762,7 +891,7 @@ class MooncakeConnectorWorker:
         logger.info(
             "The Mooncake Transfer Engine is using %s as its protocol.", protocol
         )
-        ret_value = self.engine.initialize(self.hostname, "P2PHANDSHAKE", protocol, "")
+        ret_value = self.engine.initialize(self.hostname, "P2PHANDSHAKE", protocol, "mlx5_bond_4")
         if ret_value != 0:
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
@@ -1019,18 +1148,44 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
-        local_regions = self._get_transfer_regions(
-            self.kv_caches_base_addr, self.block_len_per_layer
-        )
         remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr, meta.block_lens
         )
-        validation_err = _validate_asymmetric_region_lengths(
-            local_regions=local_regions,
-            remote_regions=remote_regions,
-            local_tp_size=self.tp_size,
-            remote_tp_size=meta.remote_tp_size,
-            producer_cache_replicated=self._producer_cache_is_replicated(),
+
+        if self.shadow_bucket_plan:
+            local_regions = self._get_shadow_transfer_regions()
+            validation_err = self._validate_shadow_transfer_regions(
+                local_regions, remote_regions
+            )
+        else:
+            local_regions = self._get_transfer_regions(
+                self.kv_caches_base_addr, self.block_len_per_layer
+            )
+            validation_err = _validate_asymmetric_region_lengths(
+                local_regions=local_regions,
+                remote_regions=remote_regions,
+                local_tp_size=self.tp_size,
+                remote_tp_size=meta.remote_tp_size,
+                producer_cache_replicated=self._producer_cache_is_replicated(),
+            )
+        logger.warning(
+            "[PD_DEBUG][regions_before_validate] "
+            "role=%s local_tp_rank=%s local_tp_size=%s remote_tp_rank=%s "
+            "remote_tp_size=%s local_region_count=%d remote_region_count=%d "
+            "local_block_lens=%s remote_block_lens=%s local_base_count=%d "
+            "remote_base_count=%d producer_cache_replicated=%s",
+            self.kv_role,
+            self.tp_rank,
+            self.tp_size,
+            meta.remote_tp_rank,
+            meta.remote_tp_size,
+            len(local_regions),
+            len(remote_regions),
+            [region.kv_block_len for region in local_regions],
+            [region.kv_block_len for region in remote_regions],
+            len(self.kv_caches_base_addr),
+            len(meta.kv_caches_base_addr),
+            self._producer_cache_is_replicated(),
         )
         if validation_err is not None:
             response = MooncakeXferResponse(
@@ -1128,6 +1283,16 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                if self.shadow_bucket_plan:
+                    logger.warning(
+                        "[PD_DEBUG][shadow_transfer_before_send] "
+                        "remote_session=%s local_regions=%s remote_regions=%s "
+                        "descriptors=%s",
+                        remote_session,
+                        _format_transfer_region_sample(local_regions),
+                        _format_transfer_region_sample(remote_regions),
+                        _format_transfer_descriptor_sample(src_ptrs, dst_ptrs, lengths),
+                    )
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self._send_blocks,
@@ -1180,6 +1345,40 @@ class MooncakeConnectorWorker:
             send_meta.need_send,
             remote_tp_ranks,
         )
+    
+    
+    def _flatten_shadow_block_ids(
+        self,
+        d_req_id: ReqId,
+        local_block_ids_per_group: list[list[int]],
+        remote_block_ids_per_group: list[list[int]],
+    ) -> tuple[list[int], list[int], str | None]:
+        local_block_ids = max(local_block_ids_per_group, key=len, default=[])
+        remote_block_ids = max(remote_block_ids_per_group, key=len, default=[])
+        local_group_lens = [len(group) for group in local_block_ids_per_group]
+        remote_group_lens = [len(group) for group in remote_block_ids_per_group]
+
+        if len(local_block_ids) < len(remote_block_ids):
+            return (
+                [],
+                [],
+                "P num blocks less than D "
+                f"(shadow local_lens={local_group_lens} "
+                f"remote_lens={remote_group_lens})",
+            )
+        if len(local_block_ids) > len(remote_block_ids):
+            local_block_ids = local_block_ids[-len(remote_block_ids) :]
+
+        logger.debug(
+            "req %s: shadow bucket selected canonical KV block groups from "
+            "local_lens=%s remote_lens=%s to %d transfer blocks.",
+            d_req_id,
+            local_group_lens,
+            remote_group_lens,
+            len(remote_block_ids),
+        )
+        return list(local_block_ids), list(remote_block_ids), None
+
 
     async def _build_transfer_params(
         self,
@@ -1212,42 +1411,60 @@ class MooncakeConnectorWorker:
             remote_block_ids: list[int] = []
             has_block_error = False
             if len(send_meta.local_block_ids) != len(remote_block_ids_per_group):
-                logger.error(
-                    "req %s: KV group count mismatch: local=%d, remote=%d",
-                    d_req_id,
-                    len(send_meta.local_block_ids),
-                    len(remote_block_ids_per_group),
-                )
-                err_reqs.append(d_req_id)
-                if err_msg is None:
-                    err_msg = "KV group count mismatch"
-                continue
-            for local_group, remote_group in zip(
-                send_meta.local_block_ids, remote_block_ids_per_group
-            ):
-                n_local = len(local_group)
-                n_remote = len(remote_group)
-                if n_local < n_remote:
-                    logger.error(
-                        "req %s: local blocks(%d) < remote blocks(%d) "
-                        "in a KV cache group",
-                        d_req_id,
-                        n_local,
-                        n_remote,
+                if self.shadow_bucket_plan:
+                    local_block_ids, remote_block_ids, block_error = (
+                        self._flatten_shadow_block_ids(
+                            d_req_id,
+                            send_meta.local_block_ids,
+                            remote_block_ids_per_group,
+                        )
                     )
-                    has_block_error = True
-                    break
-                if n_local > n_remote:
-                    # Partial prefix cache hit: just read uncomputed blocks.
-                    local_group = local_group[-n_remote:]
-                local_block_ids.extend(local_group)
-                remote_block_ids.extend(remote_group)
+                    if block_error is not None:
+                        logger.error("req %s: %s", d_req_id, block_error)
+                        err_reqs.append(d_req_id)
+                        if err_msg is None:
+                            err_msg = block_error
+                        continue
+                    if not local_block_ids:
+                        continue
+                else:
+                    logger.error(
+                        "req %s: KV group count mismatch: local=%d, remote=%d",
+                        d_req_id,
+                        len(send_meta.local_block_ids),
+                        len(remote_block_ids_per_group),
+                    )
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = "KV group count mismatch"
+                    continue
+            else:
+                for local_group, remote_group in zip(
+                    send_meta.local_block_ids, remote_block_ids_per_group
+                ):
+                    n_local = len(local_group)
+                    n_remote = len(remote_group)
+                    if n_local < n_remote:
+                        logger.error(
+                            "req %s: local blocks(%d) < remote blocks(%d) "
+                            "in a KV cache group",
+                            d_req_id,
+                            n_local,
+                            n_remote,
+                        )
+                        has_block_error = True
+                        break
+                    if n_local > n_remote:
+                        # Partial prefix cache hit: just read uncomputed blocks.
+                        local_group = local_group[-n_remote:]
+                    local_block_ids.extend(local_group)
+                    remote_block_ids.extend(remote_group)
 
-            if has_block_error:
-                err_reqs.append(d_req_id)
-                if err_msg is None:
-                    err_msg = "P num blocks less than D"
-                continue
+                if has_block_error:
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = "P num blocks less than D"
+                    continue
 
             if not local_block_ids:
                 continue
@@ -1273,6 +1490,15 @@ class MooncakeConnectorWorker:
                     # get_target_remote_ranks() so we can avoid sending
                     # unnecessary ZMQ requests and remove this branch.
                     continue
+                
+                if self.shadow_bucket_plan:
+                    transfer_len = self._get_shadow_copy_len(
+                        local_region=local_region,
+                        remote_region=remote_region,
+                        src_region_offset=src_region_offset,
+                        dst_region_offset=dst_region_offset,
+                        transfer_len=transfer_len,
+                    )
 
                 assert src_region_offset + transfer_len <= local_region.kv_block_len, (
                     "Computed source transfer region exceeds local KV block size."
@@ -1353,6 +1579,7 @@ class MooncakeConnectorWorker:
         correct CUDA device.  CUDA device selection is thread-local, so
         without this, NVLink transfers fail for TP ranks > 0."""
         current_platform.set_device(self.device_id)
+    
 
     def _send_blocks(
         self,
@@ -1361,18 +1588,132 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
+        # DEBUG_PD: Comprehensive KV cache dump before sending (P node)
+        try:
+            if src_ptrs and lengths:
+                # Find which layer/cache contains the first src_ptr
+                for layer_name, cache_or_caches in self.device_kv_caches.items():
+                    # Normalize to list of caches [K, V]
+                    if isinstance(cache_or_caches, (list, tuple)):
+                        cache_list = list(cache_or_caches)
+                    elif cache_or_caches.ndim == 5:
+                        cache_list = [cache_or_caches[0], cache_or_caches[1]]
+                    else:
+                        cache_list = [cache_or_caches]
+
+                    # Check if first src_ptr falls within any cache
+                    found = False
+                    for cache_idx, c in enumerate(cache_list):
+                        base = c.data_ptr()
+                        total_size = c.nbytes
+                        if base <= src_ptrs[0] < base + total_size:
+                            found = True
+                            break
+                    if not found:
+                        continue
+
+                    # Found the layer. Now dump ALL caches (K and V)
+                    for cache_idx, c in enumerate(cache_list):
+                        cache_label = "K" if cache_idx == 0 else "V"
+                        block_len_bytes = c.stride(0) * c.element_size()
+                        num_blocks = c.shape[0]
+
+                        # Determine which blocks have data by checking src_ptrs
+                        blocks_with_data = set()
+                        base = c.data_ptr()
+                        for sp in src_ptrs:
+                            if base <= sp < base + c.nbytes:
+                                blk = (sp - base) // block_len_bytes
+                                blocks_with_data.add(int(blk))
+
+                        # Also scan blocks 0,1,2 as reference
+                        blocks_to_scan = sorted(set([0, 1, 2]) | blocks_with_data)
+                        blocks_to_scan = [b for b in blocks_to_scan if b < num_blocks][:8]
+
+                        logger.info(
+                            "DEBUG_PD_KV_DUMP: side=P tp_rank=%d layer=%s cache=%s "
+                            "shape=%s dtype=%s ndim=%d num_blocks=%d "
+                            "block_len_bytes=%d block_shape=%s "
+                            "data_ptr=0x%x storage_offset=%d "
+                            "blocks_with_data=%s blocks_to_scan=%s",
+                            self.tp_rank, layer_name, cache_label,
+                            tuple(c.shape), str(c.dtype), c.ndim, num_blocks,
+                            block_len_bytes, tuple(c[0].shape) if num_blocks > 0 else (),
+                            c.data_ptr(), c.storage_offset(),
+                            sorted(blocks_with_data), blocks_to_scan,
+                        )
+
+                        for blk_id in blocks_to_scan:
+                            blk_tensor = c[blk_id]
+                            blk_flat = blk_tensor.contiguous().float().cpu().flatten()
+                            blk_nz = int((blk_flat != 0).sum().item())
+                            blk_max = blk_flat.max().item()
+                            blk_min = blk_flat.min().item()
+                            blk_mean = blk_flat.mean().item()
+                            blk_abs_mean = blk_flat.abs().mean().item()
+                            blk_bytes = blk_flat.numpy().tobytes()
+                            blk_checksum = hashlib.md5(blk_bytes).hexdigest()
+                            logger.info(
+                                "DEBUG_PD_KV_DUMP: side=P tp_rank=%d layer=%s cache=%s "
+                                "block_id=%d checksum=%s "
+                                "max=%.6f min=%.6f mean=%.9f abs_mean=%.9f "
+                                "non_zero=%d/%d "
+                                "first_16=%s last_16=%s "
+                                "blk_data_ptr=0x%x blk_shape=%s",
+                                self.tp_rank, layer_name, cache_label,
+                                blk_id, blk_checksum,
+                                blk_max, blk_min, blk_mean, blk_abs_mean,
+                                blk_nz, blk_flat.numel(),
+                                blk_flat[:16].tolist(), blk_flat[-16:].tolist(),
+                                blk_tensor.data_ptr(), tuple(blk_tensor.shape),
+                            )
+                        break  # Only first layer for per-block details
+
+                    # Print checksum summary for first 3 layers
+                    layer_count = 0
+                    for layer_name, cache_or_caches in self.device_kv_caches.items():
+                        layer_count += 1
+                        if layer_count > 3:
+                            break
+                        if isinstance(cache_or_caches, (list, tuple)):
+                            cache_list = list(cache_or_caches)
+                        elif cache_or_caches.ndim == 5:
+                            cache_list = [cache_or_caches[0], cache_or_caches[1]]
+                        elif cache_or_caches.ndim == 4:
+                            cache_list = [cache_or_caches]
+                        else:
+                            cache_list = [cache_or_caches]
+
+                        checksums = []
+                        for cache_idx, c in enumerate(cache_list):
+                            cache_label = "K" if cache_idx == 0 else "V"
+                            for blk_id in sorted(blocks_with_data)[:8]:
+                                if blk_id >= c.shape[0]:
+                                    continue
+                                blk_flat = c[blk_id].contiguous().float().cpu().flatten()
+                                blk_bytes = blk_flat.numpy().tobytes()
+                                blk_checksum = hashlib.md5(blk_bytes).hexdigest()[:8]
+                                checksums.append(f"{cache_label}_blk{blk_id}={blk_checksum}")
+                        logger.info(
+                            "PD_TOKEN_DEBUG KV_CHECKSUM_SUMMARY: side=P tp_rank=%d "
+                            "layer=%s checksums=[%s]",
+                            self.tp_rank, layer_name, ", ".join(checksums),
+                        )
+        except Exception as e:
+            import traceback
+            logger.warning("DEBUG_PD_KV_DUMP: P side failed: %s\n%s", e, traceback.format_exc())
+
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
         )
         duration = time.perf_counter() - start_time
         if ret_value == 0:
-            self.xfer_stats.record_transfer(
-                duration_s=duration,
-                total_bytes=sum(lengths),
-                num_descs=len(src_ptrs),
+            logger.debug(
+                "Sending to %s done, took %s",
+                remote_session,
+                time.perf_counter() - start_time,
             )
-            logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
             self.xfer_stats.record_failed_transfer()
             logger.warning(
@@ -1383,22 +1724,172 @@ class MooncakeConnectorWorker:
                 len(src_ptrs),
                 sum(lengths),
             )
+            logger.warning(
+                "Mooncake failed transfer descriptor sample: %s",
+                _format_transfer_descriptor_sample(src_ptrs, dst_ptrs, lengths),
+            )
         return ret_value
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    
+    def _get_shadow_buckets_config(self) -> Any | None:
+        assert self.vllm_config.kv_transfer_config is not None
+        return self.vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "shadow_buckets"
+        )
+
+    def _should_use_shadow_bucket_metadata(self) -> bool:
+        return self.is_kv_producer and self._get_shadow_buckets_config() is not None
+
+    def _build_shadow_bucket_metadata(
+        self,
+        source_metadata_by_name: dict[str, list[KVCacheAddressMetadata]],
+    ) -> tuple[list[int], list[int], list[int], tuple[ShadowPlacement, ...]]:
+        if self.kv_cache_config is None:
+            raise RuntimeError(
+                "Mooncake shadow bucket metadata requires KVCacheConfig."
+            )
+
+        producer_buckets = bucket_slots_from_kv_cache_tensors(
+            self.kv_cache_config.kv_cache_tensors, self.num_blocks
+        )
+        consumer_buckets = parse_shadow_buckets(self._get_shadow_buckets_config())
+        placements = build_shadow_bucket_plan(producer_buckets, consumer_buckets)
+
+        shadow_base_addrs: list[int] = []
+        source_block_lens: list[int] = []
+        target_block_lens: list[int] = []
+        for placement in placements:
+            if len(placement.source_bucket_keys) > 1:
+                logger.warning(
+                    "Mooncake shadow target bucket page_size=%d slot_idx=%d spans "
+                    "multiple producer buckets %s. Metadata-only shadow transfer "
+                    "will use producer bucket %s; a real shadow buffer/repack may "
+                    "be required for correct heterogeneous MLA cache contents.",
+                    placement.target_page_size,
+                    placement.target_slot_idx,
+                    placement.source_bucket_keys,
+                    (placement.source.page_size, placement.source.slot_idx),
+                )
+            source_metadata = source_metadata_by_name.get(placement.source.layer_name)
+            if source_metadata is None:
+                raise RuntimeError(
+                    "Mooncake shadow bucket source cache is absent from kv_caches: "
+                    f"{placement.source.layer_name!r}."
+                )
+            if len(source_metadata) != 1:
+                raise RuntimeError(
+                    "Mooncake shadow bucket currently supports one tensor per "
+                    "source logical cache, but "
+                    f"{placement.source.layer_name!r} has "
+                    f"{len(source_metadata)} tensors."
+                )
+            shadow_base_addrs.append(source_metadata[0].base_addr)
+            source_block_lens.append(source_metadata[0].block_len)
+            target_block_lens.append(placement.target_page_size)
+
+        logger.info(
+            "Enabled Mooncake shadow bucket metadata with %d placements. "
+            "source_block_lens=%s target_block_lens=%s",
+            len(placements),
+            source_block_lens,
+            target_block_lens,
+        )
+        return shadow_base_addrs, source_block_lens, target_block_lens, placements
+
+    def _get_shadow_transfer_regions(self) -> list[TransferRegion]:
+        return self._get_transfer_regions(
+            self.kv_caches_base_addr, self.block_len_per_layer
+        )
+
+    def _get_shadow_target_transfer_regions(self) -> list[TransferRegion]:
+        return self._get_transfer_regions(
+            [0] * len(self.shadow_block_len_per_layer),
+            self.shadow_block_len_per_layer,
+        )
+
+    def _get_shadow_copy_len(
+        self,
+        local_region: TransferRegion,
+        remote_region: TransferRegion,
+        src_region_offset: int,
+        dst_region_offset: int,
+        transfer_len: int,
+    ) -> int:
+        src_available = local_region.kv_block_len - src_region_offset
+        dst_available = remote_region.kv_block_len - dst_region_offset
+        return min(transfer_len, src_available, dst_available)
+
+    def _validate_shadow_region_expansion(
+        self,
+        source_regions: list[TransferRegion],
+    ) -> str | None:
+        target_regions = self._get_transfer_regions(
+            [0] * len(self.shadow_block_len_per_layer),
+            self.shadow_block_len_per_layer,
+        )
+        if len(source_regions) != len(target_regions):
+            return "Mooncake shadow transfer region expansion changed region count."
+        return None
+
+    def _validate_shadow_transfer_regions(
+        self,
+        local_regions: list[TransferRegion],
+        remote_regions: list[TransferRegion],
+    ) -> str | None:
+        if len(local_regions) != len(remote_regions):
+            return (
+                "Mooncake shadow bucket requires matching KV region counts between "
+                "producer shadow metadata and consumer metadata."
+            )
+        expansion_err = self._validate_shadow_region_expansion(local_regions)
+        if expansion_err is not None:
+            return expansion_err
+        for idx, (local_region, remote_region) in enumerate(
+            zip(local_regions, remote_regions)
+        ):
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                logger.warning(
+                    "Mooncake shadow bucket will transfer only %d bytes between "
+                    "local region %d with %d bytes per block and remote with "
+                    "%d bytes per block.",
+                    min(local_region.kv_block_len, remote_region.kv_block_len),
+                    idx,
+                    local_region.kv_block_len,
+                    remote_region.kv_block_len,
+                )
+        return None
+
+    @staticmethod
+    def _as_cache_region_list(
+        cache_or_caches: KVCacheValue,
+        split_k_and_v: bool,
+    ) -> list[torch.Tensor]:
+        if isinstance(cache_or_caches, torch.Tensor):
+            return list(cache_or_caches) if split_k_and_v else [cache_or_caches]
+
+        if isinstance(cache_or_caches, (list, tuple)):
+            return list(cache_or_caches)
+
+        raise TypeError(
+            "MooncakeConnector expected a KV cache tensor or a sequence of "
+            f"tensors, got {type(cache_or_caches).__name__}."
+        )
+
+    def register_kv_caches(self, kv_caches: dict[str, KVCacheValue]):
         """Register the KV Cache data in mooncake."""
 
         logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
 
-        kv_data_ptrs = []
-        kv_data_lens = []
+        register_ranges_by_storage: dict[int, list[tuple[int, int]]] = {}
         seen_base_addresses = []
         self.block_len_per_layer = []
+        source_metadata_by_name: dict[str, list[KVCacheAddressMetadata]] = {}
 
         split_k_and_v = self.transfer_topo.split_k_and_v
         tensor_size_bytes = None
         for layer_name, cache_or_caches in kv_caches.items():
-            cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
+            cache_list = self._as_cache_region_list(cache_or_caches, split_k_and_v)
+            source_metadata: list[KVCacheAddressMetadata] = []
             logger.debug(
                 "registering layer %s with %d cache tensor(s)",
                 layer_name,
@@ -1408,10 +1899,6 @@ class MooncakeConnectorWorker:
             for cache in cache_list:
                 self._log_debug_cache_registration(layer_name, cache)
                 base_addr = cache.data_ptr()
-                if base_addr in seen_base_addresses:
-                    continue
-
-                seen_base_addresses.append(base_addr)
 
                 if tensor_size_bytes is None:
                     tensor_size_bytes = cache.nbytes
@@ -1427,16 +1914,48 @@ class MooncakeConnectorWorker:
                 # shape-based size.
                 block_len = cache.stride(0) * cache.element_size()
 
-                self.block_len_per_layer.append(block_len)
-                kv_data_ptrs.append(base_addr)
-                kv_data_lens.append(self.num_blocks * block_len)
+                source_metadata.append(
+                    KVCacheAddressMetadata(base_addr=base_addr, block_len=block_len)
+                )
+                if base_addr in seen_base_addresses:
+                    continue
 
-        self.kv_caches_base_addr = seen_base_addresses
+                seen_base_addresses.append(base_addr)
+
+                self.block_len_per_layer.append(block_len)
+                register_len = self.num_blocks * block_len
+                storage_key = _get_tensor_storage_key(cache)
+                register_ranges_by_storage.setdefault(storage_key, []).append(
+                    (base_addr, base_addr + register_len)
+                )
+        
+            source_metadata_by_name[layer_name] = source_metadata
+
+        if self._should_use_shadow_bucket_metadata():
+            (
+                self.kv_caches_base_addr,
+                self.block_len_per_layer,
+                self.shadow_block_len_per_layer,
+                self.shadow_bucket_plan,
+            ) = self._build_shadow_bucket_metadata(source_metadata_by_name)
+        else:
+            self.kv_caches_base_addr = seen_base_addresses
+            self.shadow_block_len_per_layer = []
+            self.shadow_bucket_plan = ()
+
+        # self.kv_caches_base_addr = seen_base_addresses
         self.seen_base_addresses = seen_base_addresses
 
-        ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
+        register_ptrs, register_lens = _merge_register_ranges(
+            register_ranges_by_storage
+        )
+        ret_value = self.engine.batch_register_memory(register_ptrs, register_lens)
         if ret_value != 0:
-            raise RuntimeError("Mooncake batch memory registration failed.")
+            raise RuntimeError(
+                "Mooncake batch memory registration failed "
+                f"with ret_value={ret_value}, num_regions={len(register_ptrs)}, "
+                f"lengths={register_lens}."
+            )
 
         assert tensor_size_bytes is not None
         assert self.num_blocks != 0

@@ -1136,15 +1136,60 @@ class MooncakeStoreWorker:
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
 
+        for group_idx, group in enumerate(self._kv_cache_groups):
+            spec = group.kv_cache_spec
+            logger.warning(
+                "[PD_DEBUG][kv_cache_group_spec] "
+                "role=%s tp_rank=%s group_idx=%d spec_type=%s block_size=%s "
+                "storage_block_size=%s page_size_bytes=%s "
+                "real_page_size_bytes=%s num_layers=%s model_version=%s "
+                "cache_dtype_str=%s compress_ratio=%s",
+                self.kv_role,
+                self.tp_rank,
+                group_idx,
+                type(spec).__name__,
+                getattr(spec, "block_size", None),
+                getattr(spec, "storage_block_size", None),
+                getattr(spec, "page_size_bytes", None),
+                getattr(spec, "real_page_size_bytes", None),
+                len(getattr(group, "layer_names", [])),
+                getattr(spec, "model_version", None),
+                getattr(spec, "cache_dtype_str", None),
+                getattr(spec, "compress_ratio", None),
+            )
+
         seen_ptrs: set[int] = set()
         addrs: list[int] = []
         block_lens: list[int] = []
 
-        for value in kv_caches.values():
+        # for value in kv_caches.values():
+        for cache_name, value in kv_caches.items():
             cache = _repr_tensor(value)
+            logger.warning(
+                "[PD_DEBUG][register_kv_cache_tensor] "
+                "role=%s tp_rank=%s cache_name=%s shape=%s dtype=%s ndim=%d "
+                "stride=%s storage_nbytes=%d data_ptr=%#x",
+                self.kv_role,
+                self.tp_rank,
+                cache_name,
+                tuple(cache.shape),
+                cache.dtype,
+                cache.ndim,
+                cache.stride(),
+                cache.untyped_storage().nbytes(),
+                cache.untyped_storage().data_ptr(),
+            )
             cache_storage = cache.untyped_storage()
             base_addr = cache_storage.data_ptr()
             if base_addr in seen_ptrs:
+                logger.warning(
+                    "[PD_DEBUG][register_kv_cache_tensor_dedup] "
+                    "role=%s tp_rank=%s cache_name=%s base_addr=%#x",
+                    self.kv_role,
+                    self.tp_rank,
+                    cache_name,
+                    base_addr,
+                )
                 continue
             seen_ptrs.add(base_addr)
             region_len = cache_storage.nbytes()
@@ -1167,6 +1212,20 @@ class MooncakeStoreWorker:
             outer_dims = [
                 d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
             ]
+
+            logger.warning(
+                "[PD_DEBUG][register_kv_cache_layout] "
+                "role=%s tp_rank=%s cache_name=%s region_len=%d num_blocks=%d "
+                "page_size_bytes=%d outer_dims=%s",
+                self.kv_role,
+                self.tp_rank,
+                cache_name,
+                region_len,
+                self.num_blocks,
+                page_size_bytes,
+                outer_dims,
+            )
+
             if not outer_dims:
                 # Blocks-first layout (FlashInfer / MLA): one segment.
                 addrs.append(base_addr)
@@ -1177,6 +1236,19 @@ class MooncakeStoreWorker:
                 for idx in range(cache.shape[outer_dims[0]]):
                     addrs.append(base_addr + idx * seg_stride)
                     block_lens.append(seg_stride // self.num_blocks)
+
+        logger.warning(
+            "[PD_DEBUG][registered_kv_regions] "
+            "role=%s tp_rank=%s num_groups=%d num_segments=%d num_blocks=%d "
+            "block_lens=%s addrs=%s",
+            self.kv_role,
+            self.tp_rank,
+            len(self.token_dbs),
+            len(addrs),
+            self.num_blocks,
+            block_lens,
+            [hex(addr) for addr in addrs],
+        )
 
         logger.info(
             "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",

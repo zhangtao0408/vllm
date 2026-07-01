@@ -1217,6 +1217,7 @@ def _bucket_layers_by_page_size(
             buckets[ps][slot_idx].append(layer_name)
     return buckets
 
+from vllm.logger import logger
 
 def _get_kv_cache_config_deepseek_v4(
     vllm_config: VllmConfig,
@@ -1238,7 +1239,9 @@ def _get_kv_cache_config_deepseek_v4(
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for ps, slots in buckets.items():
-        for slot in slots:
+        # for slot in slots:
+        for i, slot in enumerate(slots):
+            logger.warning(f"[PD_DEBUG] KV_BUCKET: {ps} | {i} |  {slot}")
             kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=slot))
 
     return num_blocks, kv_cache_tensors
