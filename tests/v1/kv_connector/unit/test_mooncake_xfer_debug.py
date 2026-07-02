@@ -103,6 +103,8 @@ def test_xfer_debug_dump_records_source_slice_and_full_block(tmp_path: Path):
     assert records[0]["payload"].tolist() == list(range(20, 28))
     assert records[0]["full_source_block"].tolist() == list(range(16, 32))
     assert records[0]["descriptor"]["bucket_type"] == "c128_1728"
+    assert records[0]["tensor_name"] == "model.layers.3.attn"
+    assert "tensor_model.layers.3.attn" in Path(records[0]["path"]).name
     assert descriptor_from_dict(descriptor_to_dict(descriptor)) == descriptor
 
 
@@ -196,7 +198,9 @@ def test_native_prefill_dump_uses_materialized_block_len_for_padded_stride(
     assert records[0]["block_stride_bytes"] == 18
     assert records[0]["materialized_block_bytes"] == 16
     assert records[0]["rank_tag"] == "dp3__tp0"
-    assert Path(records[0]["path"]).name.startswith("dp3__tp0__golden__")
+    record_name = Path(records[0]["path"]).name
+    assert record_name.startswith("dp3__tp0__golden__")
+    assert "tensor_layer.padded" in record_name
 
 
 def test_compare_xfer_debug_detects_byte_and_golden_mismatch(tmp_path: Path):

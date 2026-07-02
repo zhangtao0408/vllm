@@ -150,6 +150,7 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
             payload=payload,
             tensor_dtype=str(payload_view.tensor.dtype),
             tensor_shape=tuple(payload_view.tensor.shape),
+            tensor_name=payload_view.layer_name,
             block_stride_bytes=payload_view.block_len,
             materialized_block_bytes=payload_view.readable_block_len,
             rank_tag=request.rank_tag,
@@ -162,6 +163,7 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
                 request.side,
                 descriptor,
                 request.rank_tag,
+                payload_view.layer_name,
             ),
         )
         dumped += 1
@@ -260,6 +262,7 @@ def _build_record(
     payload: torch.Tensor,
     tensor_dtype: str,
     tensor_shape: tuple[int, ...],
+    tensor_name: str,
     block_stride_bytes: int,
     materialized_block_bytes: int,
     rank_tag: str | None,
@@ -273,6 +276,7 @@ def _build_record(
         "descriptor": descriptor_to_dict(descriptor),
         "tensor_dtype": tensor_dtype,
         "tensor_shape": tensor_shape,
+        "tensor_name": tensor_name,
         "block_stride_bytes": block_stride_bytes,
         "materialized_block_bytes": materialized_block_bytes,
         "rank_tag": rank_tag,
@@ -292,10 +296,12 @@ def _record_path(
     side: str,
     descriptor: XferDebugDescriptor,
     rank_tag: str | None,
+    tensor_name: str,
 ) -> Path:
     rank_prefix = f"{_safe_name(rank_tag)}__" if rank_tag else ""
     name = (
         f"{rank_prefix}{_safe_name(side)}__tp{descriptor.tp_rank}__"
+        f"tensor_{_safe_name(tensor_name)}__"
         f"{_safe_name(descriptor.transfer_id)}__"
         f"{_safe_name(descriptor.d_req_id)}__"
         f"{descriptor.descriptor_idx:05d}.pt"

@@ -97,7 +97,9 @@ have the same request id as the PD run.
 
 With data parallelism, each DP worker applies `max_requests` independently.
 Dump files include a `dpX__tpY` prefix and a `rank_tag` field so records from
-DP4 runs can be separated after collection.
+DP4 runs can be separated after collection. File names also include
+`tensor_<name>` with the actual KV cache tensor name that supplied the dumped
+bytes.
 
 ## 4. Compare Dumps
 
@@ -127,5 +129,5 @@ The script prints:
   the 950PR `40960` source block into the H20 compact C128 bucket.
 
 Each `.pt` record contains the descriptor metadata, payload bytes,
-`payload_sha256`, tensor dtype/shape, rank tag, block stride bytes,
+`payload_sha256`, tensor name, tensor dtype/shape, rank tag, block stride bytes,
 materialized block bytes, and optional `full_source_block`.
