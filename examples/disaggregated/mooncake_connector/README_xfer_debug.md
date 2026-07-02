@@ -98,8 +98,9 @@ have the same request id as the PD run.
 With data parallelism, each DP worker applies `max_requests` independently.
 Dump files include a `dpX__tpY` prefix and a `rank_tag` field so records from
 DP4 runs can be separated after collection. File names also include
-`tensor_<name>` with the actual KV cache tensor name that supplied the dumped
-bytes.
+`tensor_<name>` with the logical KV cache name selected from the descriptor.
+For shared physical tensors, source dumps prefer `source_layer`; destination
+dumps prefer a matching name from `target_layers`.
 
 ## 4. Compare Dumps
 

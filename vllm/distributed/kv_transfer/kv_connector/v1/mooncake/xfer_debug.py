@@ -141,8 +141,14 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
             if request.pointer_kind == "source"
             else descriptor.dst_ptr
         )
-        payload_view = _find_cache_view(request.cache_views, ptr)
-        payload = read_debug_bytes(request.cache_views, ptr, descriptor.length)
+        preferred_names = _preferred_tensor_names(request.pointer_kind, descriptor)
+        payload_view = _find_cache_view(request.cache_views, ptr, preferred_names)
+        payload = read_debug_bytes(
+            request.cache_views,
+            ptr,
+            descriptor.length,
+            preferred_names,
+        )
         record = _build_record(
             side=request.side,
             pointer_kind=request.pointer_kind,
@@ -174,13 +180,14 @@ def read_debug_bytes(
     cache_views: Sequence[XferDebugCacheView],
     ptr: int,
     length: int,
+    preferred_layer_names: tuple[str, ...] = (),
 ) -> torch.Tensor:
     chunks: list[bytes] = []
     remaining = length
     cursor = ptr
 
     while remaining > 0:
-        view = _find_cache_view(cache_views, cursor)
+        view = _find_cache_view(cache_views, cursor, preferred_layer_names)
         block_id = (cursor - view.base_addr) // view.block_len
         block_offset = (cursor - view.base_addr) % view.block_len
         chunk_len = min(remaining, view.block_len - block_offset)
@@ -206,7 +213,16 @@ def read_debug_bytes(
 def _find_cache_view(
     cache_views: Sequence[XferDebugCacheView],
     ptr: int,
+    preferred_layer_names: tuple[str, ...] = (),
 ) -> XferDebugCacheView:
+    if preferred_layer_names:
+        preferred_layer_names_set = set(preferred_layer_names)
+        for view in cache_views:
+            if (
+                view.layer_name in preferred_layer_names_set
+                and view.base_addr <= ptr < view.end_addr
+            ):
+                return view
     for view in cache_views:
         if view.base_addr <= ptr < view.end_addr:
             return view
@@ -245,14 +261,25 @@ def _read_full_source_block(
     ):
         return None
     block_ptr = descriptor.src_ptr - descriptor.src_offset
-    view = _find_cache_view(request.cache_views, block_ptr)
+    preferred_names = _preferred_tensor_names(request.pointer_kind, descriptor)
+    view = _find_cache_view(request.cache_views, block_ptr, preferred_names)
     block_offset = (block_ptr - view.base_addr) % view.block_len
     readable_len = max(view.readable_block_len - block_offset, 0)
     return read_debug_bytes(
         request.cache_views,
         block_ptr,
         min(descriptor.source_block_len, readable_len),
+        preferred_names,
     )
+
+
+def _preferred_tensor_names(
+    pointer_kind: PointerKind,
+    descriptor: XferDebugDescriptor,
+) -> tuple[str, ...]:
+    if pointer_kind == "source":
+        return (descriptor.source_layer,)
+    return descriptor.target_layers
 
 
 def _build_record(

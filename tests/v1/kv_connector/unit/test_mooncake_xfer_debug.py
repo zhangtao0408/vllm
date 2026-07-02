@@ -203,6 +203,55 @@ def test_native_prefill_dump_uses_materialized_block_len_for_padded_stride(
     assert "tensor_layer.padded" in record_name
 
 
+def test_xfer_debug_prefers_descriptor_layer_name_for_shared_tensor(
+    tmp_path: Path,
+):
+    cache = torch.arange(64, dtype=torch.uint8).reshape(4, 16)
+    descriptor = XferDebugDescriptor(
+        transfer_id="transfer-1",
+        d_req_id="d-req-1",
+        tp_rank=0,
+        descriptor_idx=0,
+        region_idx=0,
+        block_id=1,
+        local_block_id=1,
+        remote_block_id=1,
+        local_block_ids=(1,),
+        remote_block_ids=(1,),
+        block_ordinals=(0,),
+        src_ptr=cache.data_ptr() + 16,
+        dst_ptr=cache.data_ptr() + 16,
+        length=16,
+        src_offset=0,
+        dst_offset=0,
+        source_layer="layer.b",
+        target_layers=("layer.a", "layer.b"),
+        source_block_len=16,
+        target_block_len=16,
+        bucket_type="16",
+    )
+
+    dump_xfer_debug_records(
+        XferDebugDumpRequest(
+            config=XferDebugConfig(dump_dir=tmp_path),
+            cache_views=build_xfer_debug_cache_views(
+                {
+                    "layer.a": cache,
+                    "layer.b": cache,
+                }
+            ),
+            side="golden",
+            pointer_kind="source",
+            descriptors=(descriptor,),
+        )
+    )
+
+    records = load_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["tensor_name"] == "layer.b"
+    assert "tensor_layer.b" in Path(records[0]["path"]).name
+
+
 def test_compare_xfer_debug_detects_byte_and_golden_mismatch(tmp_path: Path):
     prefill_dir = tmp_path / "prefill"
     decode_dir = tmp_path / "decode"
