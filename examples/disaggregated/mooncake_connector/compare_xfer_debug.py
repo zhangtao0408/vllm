@@ -159,6 +159,7 @@ def _iter_block_records(
     block_ordinals = [int(item) for item in descriptor["block_ordinals"]]
     if not block_ordinals:
         return
+    materialized_block_bytes = _materialized_block_bytes(record)
     if len(block_ordinals) <= 1:
         yield (
             (
@@ -166,7 +167,7 @@ def _iter_block_records(
                 int(descriptor["region_idx"]),
                 block_ordinals[0],
             ),
-            payload,
+            _trim_padding(payload, materialized_block_bytes),
         )
         return
     chunk_len = len(payload) // len(block_ordinals)
@@ -174,7 +175,10 @@ def _iter_block_records(
         start = offset * chunk_len
         yield (
             (int(descriptor["tp_rank"]), int(descriptor["region_idx"]), block_ordinal),
-            payload[start : start + chunk_len],
+            _trim_padding(
+                payload[start : start + chunk_len],
+                materialized_block_bytes,
+            ),
         )
 
 
@@ -189,6 +193,19 @@ def _payload_bytes(record: dict[str, Any]) -> bytes:
     if isinstance(payload, bytes):
         return payload
     return bytes(payload)
+
+
+def _materialized_block_bytes(record: dict[str, Any]) -> int:
+    value = record.get("materialized_block_bytes")
+    if isinstance(value, int) and value > 0:
+        return value
+    return 0
+
+
+def _trim_padding(payload: bytes, materialized_block_bytes: int) -> bytes:
+    if materialized_block_bytes <= 0 or materialized_block_bytes >= len(payload):
+        return payload
+    return payload[:materialized_block_bytes]
 
 
 def _first_diff(left: bytes, right: bytes) -> int | None:

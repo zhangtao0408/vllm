@@ -203,6 +203,55 @@ def test_native_prefill_dump_uses_materialized_block_len_for_padded_stride(
     assert "tensor_layer.padded" in record_name
 
 
+def test_xfer_debug_dump_preserves_padded_descriptor_len(tmp_path: Path):
+    storage = torch.arange(72, dtype=torch.uint8)
+    padded_cache = torch.as_strided(storage, size=(4, 16), stride=(18, 1))
+    descriptor = XferDebugDescriptor(
+        transfer_id="transfer-1",
+        d_req_id="d-req-1",
+        tp_rank=0,
+        descriptor_idx=0,
+        region_idx=0,
+        block_id=2,
+        local_block_id=2,
+        remote_block_id=2,
+        local_block_ids=(2,),
+        remote_block_ids=(2,),
+        block_ordinals=(0,),
+        src_ptr=padded_cache.data_ptr() + 2 * 18,
+        dst_ptr=0,
+        length=18,
+        src_offset=0,
+        dst_offset=0,
+        source_layer="layer.padded",
+        target_layers=("layer.padded",),
+        source_block_len=18,
+        target_block_len=18,
+        bucket_type="18",
+    )
+
+    dump_xfer_debug_records(
+        XferDebugDumpRequest(
+            config=XferDebugConfig(dump_dir=tmp_path),
+            cache_views=build_xfer_debug_cache_views(
+                {"layer.padded": padded_cache}
+            ),
+            side="producer",
+            pointer_kind="source",
+            descriptors=(descriptor,),
+        )
+    )
+
+    records = load_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["payload"].tolist() == list(range(36, 54))
+    assert records[0]["payload_num_bytes"] == 18
+    assert records[0]["payload_materialized_num_bytes"] == 16
+    assert records[0]["payload_padding_num_bytes"] == 2
+    assert records[0]["block_stride_bytes"] == 18
+    assert records[0]["materialized_block_bytes"] == 16
+
+
 def test_xfer_debug_prefers_descriptor_layer_name_for_shared_tensor(
     tmp_path: Path,
 ):
@@ -281,6 +330,39 @@ def test_compare_xfer_debug_detects_byte_and_golden_mismatch(tmp_path: Path):
     assert golden_results[0].max_abs > 0
 
 
+def test_compare_xfer_debug_ignores_padding_for_golden_stats(tmp_path: Path):
+    decode_dir = tmp_path / "decode"
+    golden_dir = tmp_path / "golden"
+    decode_dir.mkdir()
+    golden_dir.mkdir()
+
+    descriptor = _descriptor()
+    _save_record(
+        decode_dir / "d.pt",
+        "consumer",
+        descriptor,
+        b"\x01\x02\x03\x04\xaa\xbb",
+        materialized_block_bytes=4,
+    )
+    _save_record(
+        golden_dir / "g.pt",
+        "golden",
+        descriptor,
+        b"\x01\x02\x03\x04\xcc\xdd",
+        materialized_block_bytes=4,
+    )
+
+    golden_results = compare_decode_golden(
+        load_records(decode_dir), load_records(golden_dir)
+    )
+
+    assert len(golden_results) == 1
+    assert golden_results[0].length_match is True
+    assert golden_results[0].compared_bytes == 4
+    assert golden_results[0].max_abs == 0.0
+    assert golden_results[0].allclose is True
+
+
 def _descriptor() -> dict[str, object]:
     return descriptor_to_dict(
         XferDebugDescriptor(
@@ -327,18 +409,22 @@ def _save_record(
     side: str,
     descriptor: dict[str, object],
     payload: bytes,
+    materialized_block_bytes: int | None = None,
 ) -> None:
     payload_tensor = torch.tensor(list(payload), dtype=torch.uint8)
+    record = {
+        "kind": "mooncake_xfer_debug",
+        "side": side,
+        "pointer_kind": "source" if side != "consumer" else "destination",
+        "descriptor": descriptor,
+        "tensor_dtype": "torch.uint8",
+        "payload": payload_tensor,
+        "payload_num_bytes": len(payload),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    if materialized_block_bytes is not None:
+        record["materialized_block_bytes"] = materialized_block_bytes
     torch.save(
-        {
-            "kind": "mooncake_xfer_debug",
-            "side": side,
-            "pointer_kind": "source" if side != "consumer" else "destination",
-            "descriptor": descriptor,
-            "tensor_dtype": "torch.float16",
-            "payload": payload_tensor,
-            "payload_num_bytes": len(payload),
-            "payload_sha256": hashlib.sha256(payload).hexdigest(),
-        },
+        record,
         path,
     )

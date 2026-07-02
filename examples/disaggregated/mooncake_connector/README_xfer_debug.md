@@ -116,9 +116,11 @@ python examples/disaggregated/mooncake_connector/compare_xfer_debug.py \
 The script prints:
 
 - `P/D byte comparisons`: byte equality between 950PR source and H20 received
-  slices.
+  descriptor payloads, including padded bytes when a KV block stride is larger
+  than the materialized tensor bytes.
 - `D/golden numeric comparisons`: numeric stats between H20 received slices and
-  H20 native prefill golden slices.
+  H20 native prefill golden slices. Padding bytes are trimmed per block using
+  `materialized_block_bytes` before numeric comparison.
 
 ## 5. Result Reading
 
@@ -131,4 +133,5 @@ The script prints:
 
 Each `.pt` record contains the descriptor metadata, payload bytes,
 `payload_sha256`, tensor name, tensor dtype/shape, rank tag, block stride bytes,
-materialized block bytes, and optional `full_source_block`.
+materialized block bytes, `payload_materialized_num_bytes`,
+`payload_padding_num_bytes`, and optional `full_source_block`.

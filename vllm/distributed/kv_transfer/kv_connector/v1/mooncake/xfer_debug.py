@@ -143,6 +143,12 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
         )
         preferred_names = _preferred_tensor_names(request.pointer_kind, descriptor)
         payload_view = _find_cache_view(request.cache_views, ptr, preferred_names)
+        payload_padding_num_bytes = _padding_bytes_in_range(
+            request.cache_views,
+            ptr,
+            descriptor.length,
+            preferred_names,
+        )
         payload = read_debug_bytes(
             request.cache_views,
             ptr,
@@ -159,6 +165,7 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
             tensor_name=payload_view.layer_name,
             block_stride_bytes=payload_view.block_len,
             materialized_block_bytes=payload_view.readable_block_len,
+            payload_padding_num_bytes=payload_padding_num_bytes,
             rank_tag=request.rank_tag,
             full_source_block=_read_full_source_block(request, descriptor),
         )
@@ -191,7 +198,7 @@ def read_debug_bytes(
         block_id = (cursor - view.base_addr) // view.block_len
         block_offset = (cursor - view.base_addr) % view.block_len
         chunk_len = min(remaining, view.block_len - block_offset)
-        block_bytes = _block_bytes(view, block_id)
+        block_bytes = _block_stride_bytes(view, block_id)
         end_offset = block_offset + chunk_len
         if end_offset > len(block_bytes):
             raise XferDebugReadError(
@@ -199,7 +206,7 @@ def read_debug_bytes(
                 length=chunk_len,
                 reason=(
                     f"requested byte range [{block_offset}, {end_offset}) "
-                    f"exceeds materialized block bytes {len(block_bytes)} "
+                    f"exceeds available block bytes {len(block_bytes)} "
                     f"for layer {view.layer_name!r}"
                 ),
             )
@@ -208,6 +215,27 @@ def read_debug_bytes(
         remaining -= chunk_len
 
     return _uint8_tensor_from_bytes(b"".join(chunks))
+
+
+def _padding_bytes_in_range(
+    cache_views: Sequence[XferDebugCacheView],
+    ptr: int,
+    length: int,
+    preferred_layer_names: tuple[str, ...] = (),
+) -> int:
+    padding_bytes = 0
+    remaining = length
+    cursor = ptr
+    while remaining > 0:
+        view = _find_cache_view(cache_views, cursor, preferred_layer_names)
+        block_offset = (cursor - view.base_addr) % view.block_len
+        chunk_len = min(remaining, view.block_len - block_offset)
+        end_offset = block_offset + chunk_len
+        materialized_end = min(end_offset, view.readable_block_len)
+        padding_bytes += max(end_offset - max(block_offset, materialized_end), 0)
+        cursor += chunk_len
+        remaining -= chunk_len
+    return padding_bytes
 
 
 def _find_cache_view(
@@ -233,7 +261,7 @@ def _find_cache_view(
     )
 
 
-def _block_bytes(view: XferDebugCacheView, block_id: int) -> bytes:
+def _block_stride_bytes(view: XferDebugCacheView, block_id: int) -> bytes:
     if block_id < 0 or block_id >= view.tensor.shape[0]:
         raise XferDebugReadError(
             ptr=view.base_addr + block_id * view.block_len,
@@ -243,11 +271,43 @@ def _block_bytes(view: XferDebugCacheView, block_id: int) -> bytes:
                 f"{view.tensor.shape[0]} blocks"
             ),
         )
+    raw_storage_bytes = _raw_storage_block_bytes(view, block_id)
+    if raw_storage_bytes is not None:
+        return raw_storage_bytes
+
     block = view.tensor[block_id].detach().contiguous().cpu()
     try:
-        return block.numpy().tobytes()
+        block_bytes = block.numpy().tobytes()
     except (TypeError, RuntimeError):
-        return bytes(block.view(torch.uint8).tolist())
+        block_bytes = bytes(block.view(torch.uint8).tolist())
+
+    if len(block_bytes) >= view.block_len:
+        return block_bytes[: view.block_len]
+    return block_bytes + bytes(view.block_len - len(block_bytes))
+
+
+def _raw_storage_block_bytes(
+    view: XferDebugCacheView,
+    block_id: int,
+) -> bytes | None:
+    try:
+        storage = view.tensor.untyped_storage()
+        storage_offset = view.tensor.storage_offset() * view.tensor.element_size()
+        byte_offset = storage_offset + block_id * view.block_len
+        if byte_offset < 0 or byte_offset + view.block_len > storage.nbytes():
+            return None
+        byte_tensor = torch.empty(
+            0,
+            dtype=torch.uint8,
+            device=view.tensor.device,
+        ).set_(storage, byte_offset, (view.block_len,), (1,))
+        byte_tensor = byte_tensor.detach().contiguous().cpu()
+        try:
+            return byte_tensor.numpy().tobytes()
+        except (TypeError, RuntimeError):
+            return bytes(byte_tensor.tolist())
+    except (AttributeError, TypeError, RuntimeError):
+        return None
 
 
 def _read_full_source_block(
@@ -262,13 +322,10 @@ def _read_full_source_block(
         return None
     block_ptr = descriptor.src_ptr - descriptor.src_offset
     preferred_names = _preferred_tensor_names(request.pointer_kind, descriptor)
-    view = _find_cache_view(request.cache_views, block_ptr, preferred_names)
-    block_offset = (block_ptr - view.base_addr) % view.block_len
-    readable_len = max(view.readable_block_len - block_offset, 0)
     return read_debug_bytes(
         request.cache_views,
         block_ptr,
-        min(descriptor.source_block_len, readable_len),
+        descriptor.source_block_len,
         preferred_names,
     )
 
@@ -292,6 +349,7 @@ def _build_record(
     tensor_name: str,
     block_stride_bytes: int,
     materialized_block_bytes: int,
+    payload_padding_num_bytes: int,
     rank_tag: str | None,
     full_source_block: torch.Tensor | None,
 ) -> dict[str, Any]:
@@ -309,6 +367,10 @@ def _build_record(
         "rank_tag": rank_tag,
         "payload": payload,
         "payload_num_bytes": int(payload.numel()),
+        "payload_materialized_num_bytes": int(
+            payload.numel() - payload_padding_num_bytes
+        ),
+        "payload_padding_num_bytes": payload_padding_num_bytes,
         "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
     }
     if full_source_block is not None:
