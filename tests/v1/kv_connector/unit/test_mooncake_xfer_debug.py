@@ -434,6 +434,65 @@ def test_compare_xfer_debug_ignores_padding_for_golden_stats(tmp_path: Path):
     assert golden_results[0].allclose is True
 
 
+def test_compare_xfer_debug_reassembles_row_slices_by_remote_block_id(
+    tmp_path: Path,
+):
+    decode_dir = tmp_path / "decode"
+    golden_dir = tmp_path / "golden"
+    decode_dir.mkdir()
+    golden_dir.mkdir()
+
+    descriptor = _descriptor()
+    descriptor.update(
+        {
+            "block_id": 9,
+            "remote_block_id": 9,
+            "remote_block_ids": (9,),
+            "length": 1,
+            "target_block_len": 4,
+            "bucket_type": "row_slice",
+            "target_layers": ("layer.row",),
+        }
+    )
+    for offset, value in enumerate((1, 2, 3, 4)):
+        _save_record(
+            decode_dir / f"d{offset}.pt",
+            "consumer",
+            {
+                **descriptor,
+                "descriptor_idx": offset,
+                "dst_offset": offset,
+                "block_ordinals": (0,),
+            },
+            bytes([value]),
+            materialized_block_bytes=4,
+            logical_tensor_names=("layer.row",),
+        )
+    _save_record(
+        golden_dir / "g.pt",
+        "golden",
+        {
+            **descriptor,
+            "descriptor_idx": 99,
+            "dst_offset": 0,
+            "block_ordinals": (7,),
+        },
+        b"\x01\x02\x03\x04",
+        materialized_block_bytes=4,
+        tensor_name="layer.row",
+    )
+
+    golden_results = compare_decode_golden(
+        load_records(decode_dir), load_records(golden_dir)
+    )
+
+    assert len(golden_results) == 1
+    assert golden_results[0].key == (0, "layer.row", 0)
+    assert golden_results[0].length_match is True
+    assert golden_results[0].compared_bytes == 4
+    assert golden_results[0].allclose is True
+
+
 def test_compare_xfer_debug_expands_decode_logical_aliases(tmp_path: Path):
     decode_dir = tmp_path / "decode"
     golden_dir = tmp_path / "golden"

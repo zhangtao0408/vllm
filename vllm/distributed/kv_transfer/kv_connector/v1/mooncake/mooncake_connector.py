@@ -410,6 +410,9 @@ class MooncakeXferMetadata(
     block_lens: list[int]
     kv_cache_group_layer_names: list[list[str]] = msgspec.field(default_factory=list)
     kv_cache_group_block_lens: list[int] = msgspec.field(default_factory=list)
+    kv_cache_layer_materialized_block_lens: dict[str, int] = msgspec.field(
+        default_factory=dict
+    )
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -899,6 +902,7 @@ class MooncakeConnectorWorker:
         self.shadow_sources_by_layer: dict[str, ShadowTransferSource] = {}
         self.kv_cache_group_layer_names: list[list[str]] = []
         self.kv_cache_group_block_lens: list[int] = []
+        self.kv_cache_layer_materialized_block_lens: dict[str, int] = {}
         self.layer_to_group_index: dict[str, int] = {}
 
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
@@ -1812,10 +1816,14 @@ class MooncakeConnectorWorker:
                 if remote_group_idx >= len(remote_block_ids_per_group):
                     continue
                 target_block_len = (
-                    agent_meta.kv_cache_group_block_lens[remote_group_idx]
-                    if remote_group_idx < len(agent_meta.kv_cache_group_block_lens)
-                    else remote_region.kv_block_len
+                    agent_meta.kv_cache_layer_materialized_block_lens.get(target_key)
                 )
+                if target_block_len is None:
+                    target_block_len = (
+                        agent_meta.kv_cache_group_block_lens[remote_group_idx]
+                        if remote_group_idx < len(agent_meta.kv_cache_group_block_lens)
+                        else remote_region.kv_block_len
+                    )
                 local_block_ids, remote_block_ids, block_error = (
                     self._trim_shadow_group_blocks(
                         send_meta.local_block_ids[source.group_idx],
@@ -2180,8 +2188,17 @@ class MooncakeConnectorWorker:
         if self.kv_cache_config is None:
             self.kv_cache_group_layer_names = []
             self.kv_cache_group_block_lens = []
+            self.kv_cache_layer_materialized_block_lens = {}
             self.layer_to_group_index = {}
             return
+
+        layer_materialized_block_lens: dict[str, int] = {}
+        for layer_name, metadata in source_metadata_by_name.items():
+            if not metadata:
+                continue
+            layer_materialized_block_lens[canonical_cache_name(layer_name)] = max(
+                item.materialized_block_len or item.block_len for item in metadata
+            )
 
         group_layer_names: list[list[str]] = []
         group_block_lens: list[int] = []
@@ -2203,6 +2220,7 @@ class MooncakeConnectorWorker:
 
         self.kv_cache_group_layer_names = group_layer_names
         self.kv_cache_group_block_lens = group_block_lens
+        self.kv_cache_layer_materialized_block_lens = layer_materialized_block_lens
         self.layer_to_group_index = layer_to_group_index
 
     def _build_shadow_bucket_metadata(
@@ -2599,6 +2617,9 @@ class MooncakeConnectorWorker:
             block_lens=self.block_len_per_layer,
             kv_cache_group_layer_names=self.kv_cache_group_layer_names,
             kv_cache_group_block_lens=self.kv_cache_group_block_lens,
+            kv_cache_layer_materialized_block_lens=(
+                self.kv_cache_layer_materialized_block_lens
+            ),
         )
 
         encoded_data = self._encoder.encode(metadata)

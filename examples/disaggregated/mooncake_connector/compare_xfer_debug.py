@@ -3,6 +3,7 @@
 
 import argparse
 import math
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,29 @@ class GoldenComparison:
     mean_abs: float | None
     cosine: float | None
     allclose: bool | None
+
+
+ChunkMatchKey = tuple[str, int, str, int]
+
+
+@dataclass(frozen=True)
+class _ChunkPiece:
+    key: tuple[int, str, int]
+    match_keys: tuple[ChunkMatchKey, ...]
+    dst_offset: int
+    payload: bytes
+    materialized_block_bytes: int
+    bucket_type: str
+    dtype_name: str
+
+
+@dataclass(frozen=True)
+class _TensorChunk:
+    key: tuple[int, str, int]
+    match_keys: tuple[ChunkMatchKey, ...]
+    payload: bytes
+    bucket_type: str
+    dtype_name: str
 
 
 def load_records(dump_dir: Path) -> list[dict[str, Any]]:
@@ -110,40 +134,166 @@ def compare_decode_golden(
     decode_records: Iterable[dict[str, Any]],
     golden_records: Iterable[dict[str, Any]],
 ) -> list[GoldenComparison]:
-    golden_chunks = {
-        key: chunk
-        for record in golden_records
-        if record.get("side") == "golden"
-        for key, chunk in _iter_block_records(record)
-    }
+    golden_chunks: dict[ChunkMatchKey, _TensorChunk] = {}
+    for chunk in _materialize_side_chunks(golden_records, "golden"):
+        for match_key in chunk.match_keys:
+            golden_chunks.setdefault(match_key, chunk)
+
     comparisons: list[GoldenComparison] = []
-    for decode_record in decode_records:
-        if decode_record.get("side") != "consumer":
+    for decode_chunk in _materialize_side_chunks(decode_records, "consumer"):
+        golden_chunk = None
+        for match_key in decode_chunk.match_keys:
+            golden_chunk = golden_chunks.get(match_key)
+            if golden_chunk is not None:
+                break
+        if golden_chunk is None:
             continue
-        for key, chunk in _iter_block_records(decode_record):
-            golden_bytes = golden_chunks.get(key)
-            if golden_bytes is None:
-                continue
-            compare_len = min(len(chunk), len(golden_bytes))
-            stats = _numeric_stats(
-                chunk[:compare_len],
-                golden_bytes[:compare_len],
-                str(decode_record.get("tensor_dtype", "")),
+
+        compare_len = min(len(decode_chunk.payload), len(golden_chunk.payload))
+        stats = _numeric_stats(
+            decode_chunk.payload[:compare_len],
+            golden_chunk.payload[:compare_len],
+            decode_chunk.dtype_name,
+        )
+        comparisons.append(
+            GoldenComparison(
+                key=decode_chunk.key,
+                bucket_type=decode_chunk.bucket_type,
+                length_match=len(decode_chunk.payload) == len(golden_chunk.payload),
+                compared_bytes=compare_len,
+                max_abs=stats[0],
+                mean_abs=stats[1],
+                cosine=stats[2],
+                allclose=stats[3],
             )
-            descriptor = decode_record["descriptor"]
-            comparisons.append(
-                GoldenComparison(
-                    key=key,
-                    bucket_type=str(descriptor["bucket_type"]),
-                    length_match=len(chunk) == len(golden_bytes),
-                    compared_bytes=compare_len,
-                    max_abs=stats[0],
-                    mean_abs=stats[1],
-                    cosine=stats[2],
-                    allclose=stats[3],
-                )
-            )
+        )
     return comparisons
+
+
+def _materialize_side_chunks(
+    records: Iterable[dict[str, Any]],
+    side: str,
+) -> list[_TensorChunk]:
+    pieces_by_key: dict[ChunkMatchKey, list[_ChunkPiece]] = defaultdict(list)
+    ordered_keys: list[ChunkMatchKey] = []
+
+    for record in records:
+        if record.get("side") != side:
+            continue
+        for piece in _iter_chunk_pieces(record):
+            group_key = piece.match_keys[0]
+            if group_key not in pieces_by_key:
+                ordered_keys.append(group_key)
+            pieces_by_key[group_key].append(piece)
+
+    chunks: list[_TensorChunk] = []
+    for group_key in ordered_keys:
+        pieces = pieces_by_key[group_key]
+        first_piece = pieces[0]
+        materialized_block_bytes = max(
+            piece.materialized_block_bytes for piece in pieces
+        )
+        max_written = max(piece.dst_offset + len(piece.payload) for piece in pieces)
+        chunk_len = materialized_block_bytes or max_written
+        payload = bytearray(chunk_len)
+        for piece in pieces:
+            start = piece.dst_offset
+            if start >= chunk_len:
+                continue
+            end = min(start + len(piece.payload), chunk_len)
+            payload[start:end] = piece.payload[: end - start]
+        chunks.append(
+            _TensorChunk(
+                key=first_piece.key,
+                match_keys=first_piece.match_keys,
+                payload=bytes(payload),
+                bucket_type=first_piece.bucket_type,
+                dtype_name=first_piece.dtype_name,
+            )
+        )
+    return chunks
+
+
+def _iter_chunk_pieces(record: dict[str, Any]) -> Iterable[_ChunkPiece]:
+    descriptor = record["descriptor"]
+    payload = _payload_bytes(record)
+    block_ordinals = [int(item) for item in descriptor["block_ordinals"]]
+    if not block_ordinals:
+        return
+
+    remote_block_ids = [int(item) for item in descriptor.get("remote_block_ids", ())]
+    if not remote_block_ids:
+        remote_block_ids = [
+            int(descriptor.get("remote_block_id", descriptor["block_id"]))
+        ]
+    tensor_names = _logical_tensor_names(record)
+    materialized_block_bytes = _materialized_block_bytes(record)
+    dst_offset = int(descriptor.get("dst_offset", 0))
+    dtype_name = str(record.get("tensor_dtype", ""))
+    bucket_type = str(descriptor["bucket_type"])
+
+    if len(block_ordinals) > 1:
+        chunk_len = len(payload) // len(block_ordinals)
+        chunk_ranges = [
+            (idx * chunk_len, (idx + 1) * chunk_len)
+            for idx in range(len(block_ordinals))
+        ]
+    else:
+        chunk_ranges = [(0, len(payload))]
+
+    for idx, (start, end) in enumerate(chunk_ranges):
+        block_ordinal = block_ordinals[idx]
+        remote_block_id = (
+            remote_block_ids[idx]
+            if idx < len(remote_block_ids)
+            else int(descriptor.get("remote_block_id", descriptor["block_id"]))
+        )
+        chunk = _trim_piece_padding(
+            payload[start:end],
+            materialized_block_bytes,
+            dst_offset,
+        )
+        for tensor_name in tensor_names:
+            canonical_name = _canonical_tensor_name(tensor_name)
+            yield _ChunkPiece(
+                key=(int(descriptor["tp_rank"]), canonical_name, block_ordinal),
+                match_keys=_chunk_match_keys(
+                    int(descriptor["tp_rank"]),
+                    canonical_name,
+                    remote_block_id,
+                    block_ordinal,
+                ),
+                dst_offset=dst_offset,
+                payload=chunk,
+                materialized_block_bytes=materialized_block_bytes,
+                bucket_type=bucket_type,
+                dtype_name=dtype_name,
+            )
+
+
+def _chunk_match_keys(
+    tp_rank: int,
+    tensor_name: str,
+    remote_block_id: int | None,
+    block_ordinal: int | None,
+) -> tuple[ChunkMatchKey, ...]:
+    keys: list[ChunkMatchKey] = []
+    if remote_block_id is not None:
+        keys.append(("remote", tp_rank, tensor_name, remote_block_id))
+    if block_ordinal is not None:
+        keys.append(("ordinal", tp_rank, tensor_name, block_ordinal))
+    return tuple(keys)
+
+
+def _trim_piece_padding(
+    payload: bytes,
+    materialized_block_bytes: int,
+    dst_offset: int,
+) -> bytes:
+    if materialized_block_bytes <= 0:
+        return payload
+    remaining = max(materialized_block_bytes - dst_offset, 0)
+    return payload[:remaining]
 
 
 def main() -> int:
@@ -210,35 +360,6 @@ def _diagnostic_key(record: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
-def _iter_block_records(
-    record: dict[str, Any],
-) -> Iterable[tuple[tuple[int, str, int], bytes]]:
-    descriptor = record["descriptor"]
-    payload = _payload_bytes(record)
-    block_ordinals = [int(item) for item in descriptor["block_ordinals"]]
-    if not block_ordinals:
-        return
-    tensor_names = _logical_tensor_names(record)
-    materialized_block_bytes = _materialized_block_bytes(record)
-    if len(block_ordinals) <= 1:
-        chunk = _trim_padding(payload, materialized_block_bytes)
-        for tensor_name in tensor_names:
-            yield (
-                (int(descriptor["tp_rank"]), tensor_name, block_ordinals[0]),
-                chunk,
-            )
-        return
-    chunk_len = len(payload) // len(block_ordinals)
-    for offset, block_ordinal in enumerate(block_ordinals):
-        start = offset * chunk_len
-        chunk = _trim_padding(
-            payload[start : start + chunk_len],
-            materialized_block_bytes,
-        )
-        for tensor_name in tensor_names:
-            yield ((int(descriptor["tp_rank"]), tensor_name, block_ordinal), chunk)
-
-
 def _logical_tensor_names(record: dict[str, Any]) -> tuple[str, ...]:
     descriptor = record["descriptor"]
     tensor_name = record.get("tensor_name")
@@ -290,12 +411,6 @@ def _materialized_block_bytes(record: dict[str, Any]) -> int:
     if isinstance(value, int) and value > 0:
         return value
     return 0
-
-
-def _trim_padding(payload: bytes, materialized_block_bytes: int) -> bytes:
-    if materialized_block_bytes <= 0 or materialized_block_bytes >= len(payload):
-        return payload
-    return payload[:materialized_block_bytes]
 
 
 def _first_diff(left: bytes, right: bytes) -> int | None:
