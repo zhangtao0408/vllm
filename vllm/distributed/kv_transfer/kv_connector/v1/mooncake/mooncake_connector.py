@@ -1411,6 +1411,7 @@ class MooncakeConnectorWorker:
                     side=side,
                     pointer_kind=pointer_kind,
                     descriptors=selected_descriptors,
+                    rank_tag=f"dp{self.dp_rank}__tp{self.tp_rank}",
                 )
             )
         except (OSError, RuntimeError, XferDebugReadError, ValueError) as exc:
@@ -2037,6 +2038,9 @@ class MooncakeConnectorWorker:
                             tensor=cache,
                             base_addr=base_addr,
                             block_len=block_len,
+                            materialized_block_len=(
+                                cache[0].numel() * cache.element_size()
+                            ),
                         )
                     )
 

@@ -76,7 +76,8 @@ def build_xfer_debug_cache_views(
             layer_name=layer_name,
             tensor=tensor,
             base_addr=tensor.data_ptr(),
-            block_len=_block_len(tensor),
+            block_len=_block_stride_len(tensor),
+            materialized_block_len=_materialized_block_len(tensor),
         )
         for layer_name, tensor in kv_caches.items()
     )
@@ -113,15 +114,16 @@ def build_native_kv_cache_descriptors(
                 continue
 
             tensor = request.kv_caches[source_layer]
-            block_len = _block_len(tensor)
+            block_stride_len = _block_stride_len(tensor)
+            materialized_block_len = _materialized_block_len(tensor)
             region_info = XferDebugRegionInfo(
                 source_layer=source_layer,
                 target_layers=target_layers,
-                source_block_len=block_len,
-                target_block_len=block_len,
+                source_block_len=materialized_block_len,
+                target_block_len=block_stride_len,
             )
             for block_id in request.group_block_ids[group_idx]:
-                ptr = tensor.data_ptr() + block_id * block_len
+                ptr = tensor.data_ptr() + block_id * block_stride_len
                 descriptors.append(
                     XferDebugDescriptor(
                         transfer_id=request.transfer_id,
@@ -137,7 +139,7 @@ def build_native_kv_cache_descriptors(
                         block_ordinals=(block_ordinal,),
                         src_ptr=ptr,
                         dst_ptr=ptr,
-                        length=block_len,
+                        length=materialized_block_len,
                         src_offset=0,
                         dst_offset=0,
                         source_layer=source_layer,
@@ -177,5 +179,9 @@ def _select_region_sources(
     )
 
 
-def _block_len(tensor: torch.Tensor) -> int:
+def _block_stride_len(tensor: torch.Tensor) -> int:
     return tensor.stride(0) * tensor.element_size()
+
+
+def _materialized_block_len(tensor: torch.Tensor) -> int:
+    return tensor[0].numel() * tensor.element_size()

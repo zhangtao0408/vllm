@@ -95,6 +95,10 @@ Then send the same prompt as the PD run, using the same 4-layer model slice and
 sampling settings. The dumped records use `side="golden"` and do not need to
 have the same request id as the PD run.
 
+With data parallelism, each DP worker applies `max_requests` independently.
+Dump files include a `dpX__tpY` prefix and a `rank_tag` field so records from
+DP4 runs can be separated after collection.
+
 ## 4. Compare Dumps
 
 Run from the vLLM repository root:
@@ -123,4 +127,5 @@ The script prints:
   the 950PR `40960` source block into the H20 compact C128 bucket.
 
 Each `.pt` record contains the descriptor metadata, payload bytes,
-`payload_sha256`, tensor dtype/shape, and optional `full_source_block`.
+`payload_sha256`, tensor dtype/shape, rank tag, block stride bytes,
+materialized block bytes, and optional `full_source_block`.

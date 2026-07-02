@@ -48,10 +48,17 @@ class XferDebugCacheView:
     tensor: torch.Tensor
     base_addr: int
     block_len: int
+    materialized_block_len: int | None = None
 
     @property
     def end_addr(self) -> int:
         return self.base_addr + self.tensor.shape[0] * self.block_len
+
+    @property
+    def readable_block_len(self) -> int:
+        if self.materialized_block_len is None:
+            return self.block_len
+        return self.materialized_block_len
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,7 @@ class XferDebugDumpRequest:
     side: str
     pointer_kind: PointerKind
     descriptors: tuple["XferDebugDescriptor", ...]
+    rank_tag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,11 +150,19 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
             payload=payload,
             tensor_dtype=str(payload_view.tensor.dtype),
             tensor_shape=tuple(payload_view.tensor.shape),
+            block_stride_bytes=payload_view.block_len,
+            materialized_block_bytes=payload_view.readable_block_len,
+            rank_tag=request.rank_tag,
             full_source_block=_read_full_source_block(request, descriptor),
         )
         torch.save(
             record,
-            _record_path(request.config.dump_dir, request.side, descriptor),
+            _record_path(
+                request.config.dump_dir,
+                request.side,
+                descriptor,
+                request.rank_tag,
+            ),
         )
         dumped += 1
     return dumped
@@ -227,7 +243,14 @@ def _read_full_source_block(
     ):
         return None
     block_ptr = descriptor.src_ptr - descriptor.src_offset
-    return read_debug_bytes(request.cache_views, block_ptr, descriptor.source_block_len)
+    view = _find_cache_view(request.cache_views, block_ptr)
+    block_offset = (block_ptr - view.base_addr) % view.block_len
+    readable_len = max(view.readable_block_len - block_offset, 0)
+    return read_debug_bytes(
+        request.cache_views,
+        block_ptr,
+        min(descriptor.source_block_len, readable_len),
+    )
 
 
 def _build_record(
@@ -237,6 +260,9 @@ def _build_record(
     payload: torch.Tensor,
     tensor_dtype: str,
     tensor_shape: tuple[int, ...],
+    block_stride_bytes: int,
+    materialized_block_bytes: int,
+    rank_tag: str | None,
     full_source_block: torch.Tensor | None,
 ) -> dict[str, Any]:
     payload_bytes = bytes(payload.tolist())
@@ -247,6 +273,9 @@ def _build_record(
         "descriptor": descriptor_to_dict(descriptor),
         "tensor_dtype": tensor_dtype,
         "tensor_shape": tensor_shape,
+        "block_stride_bytes": block_stride_bytes,
+        "materialized_block_bytes": materialized_block_bytes,
+        "rank_tag": rank_tag,
         "payload": payload,
         "payload_num_bytes": int(payload.numel()),
         "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
@@ -262,9 +291,11 @@ def _record_path(
     dump_dir: Path,
     side: str,
     descriptor: XferDebugDescriptor,
+    rank_tag: str | None,
 ) -> Path:
+    rank_prefix = f"{_safe_name(rank_tag)}__" if rank_tag else ""
     name = (
-        f"{_safe_name(side)}__tp{descriptor.tp_rank}__"
+        f"{rank_prefix}{_safe_name(side)}__tp{descriptor.tp_rank}__"
         f"{_safe_name(descriptor.transfer_id)}__"
         f"{_safe_name(descriptor.d_req_id)}__"
         f"{descriptor.descriptor_idx:05d}.pt"

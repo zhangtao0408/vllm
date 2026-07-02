@@ -1002,6 +1002,10 @@ class GPUModelRunner(
                     side="golden",
                     pointer_kind="source",
                     descriptors=tuple(descriptors),
+                    rank_tag=(
+                        f"dp{self.parallel_config.data_parallel_rank}__"
+                        f"tp{get_tp_group().rank_in_group}"
+                    ),
                 )
             )
         except (OSError, RuntimeError, XferDebugReadError, ValueError) as exc:

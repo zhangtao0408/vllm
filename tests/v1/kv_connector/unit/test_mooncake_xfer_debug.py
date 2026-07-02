@@ -145,9 +145,58 @@ def test_native_prefill_descriptors_follow_kv_cache_tensor_order():
     assert descriptors[2].block_ordinals == (2,)
     assert descriptors[3].target_layers == ("layer.c",)
     assert [
-        (view.layer_name, view.base_addr, view.block_len)
+        (
+            view.layer_name,
+            view.base_addr,
+            view.block_len,
+            view.materialized_block_len,
+        )
         for view in build_xfer_debug_cache_views({"layer.a": cache_a})
-    ] == [("layer.a", cache_a.data_ptr(), 16)]
+    ] == [("layer.a", cache_a.data_ptr(), 16, 16)]
+
+
+def test_native_prefill_dump_uses_materialized_block_len_for_padded_stride(
+    tmp_path: Path,
+):
+    storage = torch.arange(72, dtype=torch.uint8)
+    padded_cache = torch.as_strided(storage, size=(4, 16), stride=(18, 1))
+    kv_cache_config = _FakeKVCacheConfig(
+        kv_cache_tensors=(_FakeKVCacheTensor(shared_by=("layer.padded",)),),
+        kv_cache_groups=(_FakeKVCacheGroup(layer_names=("layer.padded",)),),
+    )
+
+    descriptors = build_native_kv_cache_descriptors(
+        NativeKVCacheDescriptorRequest(
+            kv_cache_config=kv_cache_config,
+            kv_caches={"layer.padded": padded_cache},
+            request_id="req-1",
+            transfer_id="native-prefill",
+            tp_rank=0,
+            group_block_ids=((2,),),
+        )
+    )
+    dumped = dump_xfer_debug_records(
+        XferDebugDumpRequest(
+            config=XferDebugConfig(dump_dir=tmp_path),
+            cache_views=build_xfer_debug_cache_views({"layer.padded": padded_cache}),
+            side="golden",
+            pointer_kind="source",
+            descriptors=descriptors,
+            rank_tag="dp3__tp0",
+        )
+    )
+
+    records = load_records(tmp_path)
+    assert dumped == 1
+    assert len(records) == 1
+    assert descriptors[0].length == 16
+    assert descriptors[0].source_block_len == 16
+    assert descriptors[0].target_block_len == 18
+    assert records[0]["payload"].tolist() == list(range(36, 52))
+    assert records[0]["block_stride_bytes"] == 18
+    assert records[0]["materialized_block_bytes"] == 16
+    assert records[0]["rank_tag"] == "dp3__tp0"
+    assert Path(records[0]["path"]).name.startswith("dp3__tp0__golden__")
 
 
 def test_compare_xfer_debug_detects_byte_and_golden_mismatch(tmp_path: Path):
