@@ -157,6 +157,40 @@ def test_native_prefill_descriptors_follow_kv_cache_tensor_order():
     ] == [("layer.a", cache_a.data_ptr(), 16, 16)]
 
 
+def test_native_prefill_debug_handles_tuple_kv_cache():
+    primary_cache = torch.arange(64, dtype=torch.uint8).reshape(4, 16)
+    aux_cache = torch.arange(128, dtype=torch.uint8).reshape(4, 32)
+    kv_cache_config = _FakeKVCacheConfig(
+        kv_cache_tensors=(_FakeKVCacheTensor(shared_by=("layer.tuple",)),),
+        kv_cache_groups=(_FakeKVCacheGroup(layer_names=("layer.tuple",)),),
+    )
+
+    descriptors = build_native_kv_cache_descriptors(
+        NativeKVCacheDescriptorRequest(
+            kv_cache_config=kv_cache_config,
+            kv_caches={"layer.tuple": (primary_cache, None, aux_cache)},
+            request_id="req-1",
+            transfer_id="native-prefill",
+            tp_rank=0,
+            group_block_ids=((2,),),
+        )
+    )
+    views = build_xfer_debug_cache_views(
+        {"layer.tuple": (primary_cache, None, aux_cache)}
+    )
+
+    assert len(descriptors) == 1
+    assert descriptors[0].src_ptr == primary_cache.data_ptr() + 2 * 16
+    assert descriptors[0].length == 16
+    assert [
+        (view.layer_name, view.base_addr, view.block_len)
+        for view in views
+    ] == [
+        ("layer.tuple", primary_cache.data_ptr(), 16),
+        ("layer.tuple#tensor2", aux_cache.data_ptr(), 32),
+    ]
+
+
 def test_native_prefill_dump_uses_materialized_block_len_for_padded_stride(
     tmp_path: Path,
 ):

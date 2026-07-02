@@ -32,6 +32,9 @@ class KVCacheConfigLike(Protocol):
     def kv_cache_groups(self) -> Sequence[KVCacheGroupLike]: ...
 
 
+KVCacheDebugValue = torch.Tensor | Sequence[torch.Tensor | None]
+
+
 class BlockRowLike(Protocol):
     def tolist(self) -> list[int]: ...
 
@@ -61,7 +64,7 @@ class MultiGroupBlockTableLike(Protocol):
 @dataclass(frozen=True, slots=True)
 class NativeKVCacheDescriptorRequest:
     kv_cache_config: KVCacheConfigLike
-    kv_caches: Mapping[str, torch.Tensor]
+    kv_caches: Mapping[str, KVCacheDebugValue]
     request_id: str
     transfer_id: str
     tp_rank: int
@@ -69,18 +72,52 @@ class NativeKVCacheDescriptorRequest:
 
 
 def build_xfer_debug_cache_views(
-    kv_caches: Mapping[str, torch.Tensor],
+    kv_caches: Mapping[str, KVCacheDebugValue],
 ) -> tuple[XferDebugCacheView, ...]:
+    views: list[XferDebugCacheView] = []
+    for layer_name, kv_cache in kv_caches.items():
+        for tensor_idx, tensor in _iter_cache_tensors(kv_cache):
+            physical_layer_name = (
+                layer_name if tensor_idx == 0 else f"{layer_name}#tensor{tensor_idx}"
+            )
+            views.append(
+                XferDebugCacheView(
+                    layer_name=physical_layer_name,
+                    tensor=tensor,
+                    base_addr=tensor.data_ptr(),
+                    block_len=_block_stride_len(tensor),
+                    materialized_block_len=_materialized_block_len(tensor),
+                )
+            )
+    return tuple(views)
+
+
+def _iter_cache_tensors(
+    kv_cache: KVCacheDebugValue,
+) -> tuple[tuple[int, torch.Tensor], ...]:
+    if isinstance(kv_cache, torch.Tensor):
+        return ((0, kv_cache),)
     return tuple(
-        XferDebugCacheView(
-            layer_name=layer_name,
-            tensor=tensor,
-            base_addr=tensor.data_ptr(),
-            block_len=_block_stride_len(tensor),
-            materialized_block_len=_materialized_block_len(tensor),
-        )
-        for layer_name, tensor in kv_caches.items()
+        (tensor_idx, tensor)
+        for tensor_idx, tensor in enumerate(kv_cache)
+        if tensor is not None
     )
+
+
+def _primary_cache_tensor(
+    kv_cache: KVCacheDebugValue,
+) -> torch.Tensor | None:
+    for _, tensor in _iter_cache_tensors(kv_cache):
+        return tensor
+    return None
+
+
+def _has_cache_tensor(
+    kv_caches: Mapping[str, KVCacheDebugValue],
+    layer_name: str,
+) -> bool:
+    kv_cache = kv_caches.get(layer_name)
+    return kv_cache is not None and _primary_cache_tensor(kv_cache) is not None
 
 
 def collect_group_block_ids(
@@ -113,7 +150,9 @@ def build_native_kv_cache_descriptors(
             if group_idx >= len(request.group_block_ids):
                 continue
 
-            tensor = request.kv_caches[source_layer]
+            tensor = _primary_cache_tensor(request.kv_caches[source_layer])
+            if tensor is None:
+                continue
             block_stride_len = _block_stride_len(tensor)
             materialized_block_len = _materialized_block_len(tensor)
             region_info = XferDebugRegionInfo(
@@ -163,7 +202,7 @@ def _build_layer_to_group_index(kv_cache_config: KVCacheConfigLike) -> dict[str,
 
 def _select_region_sources(
     layer_to_group_index: Mapping[str, int],
-    kv_caches: Mapping[str, torch.Tensor],
+    kv_caches: Mapping[str, KVCacheDebugValue],
     target_layers: tuple[str, ...],
 ) -> tuple[tuple[str, int], ...]:
     sources_by_group: dict[int, str] = {}
@@ -171,7 +210,7 @@ def _select_region_sources(
         group_idx = layer_to_group_index.get(layer_name)
         if group_idx is None or group_idx in sources_by_group:
             continue
-        if layer_name in kv_caches:
+        if _has_cache_tensor(kv_caches, layer_name):
             sources_by_group[group_idx] = layer_name
     return tuple(
         (source_layer, group_idx)

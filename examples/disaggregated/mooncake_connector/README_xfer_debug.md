@@ -16,7 +16,7 @@ Run this before each test to avoid comparing stale records:
 
 ```bash
 rm -rf /tmp/pd_xfer_4l
-mkdir -p /tmp/pd_xfer_4l/{prefill,decode,h20_golden}
+mkdir -p /tmp/pd_xfer_4l/{prefill,decode,h20_golden,ascend_native}
 ```
 
 ## 2. Dump PD Transfer Slices
@@ -102,7 +102,37 @@ DP4 runs can be separated after collection. File names also include
 For shared physical tensors, source dumps prefer `source_layer`; destination
 dumps prefer a matching name from `target_layers`.
 
-## 4. Compare Dumps
+## 4. Dump 950PR Native Prefill
+
+This is for the 950PR mixed/native run through vLLM-Ascend. Do not configure
+`kv_connector` here. vLLM-Ascend's native runner also reads
+`VLLM_KV_XFER_DEBUG_CONFIG`.
+
+Create a config file:
+
+```bash
+cat >/tmp/ascend_native_xfer_debug.json <<'JSON'
+{
+  "dump_dir": "/tmp/pd_xfer_4l/ascend_native",
+  "max_requests": 1,
+  "dump_on_prefill": true
+}
+JSON
+```
+
+Start the normal 950PR native service with:
+
+```bash
+export VLLM_KV_XFER_DEBUG_CONFIG=/tmp/ascend_native_xfer_debug.json
+```
+
+Then send the same prompt as the PD and H20 native runs, using the same 4-layer
+model slice and sampling settings. This dump captures Ascend prefill KV after
+the forward pass and before sampling. For tuple KV caches, the first tensor keeps
+the original physical layer name and later tensors use `#tensorN` suffixes in
+the debug view names.
+
+## 5. Compare Dumps
 
 Run from the vLLM repository root:
 
@@ -122,7 +152,7 @@ The script prints:
   H20 native prefill golden slices. Padding bytes are trimmed per block using
   `materialized_block_bytes` before numeric comparison.
 
-## 5. Result Reading
+## 6. Result Reading
 
 - `P/D` shows `DIFF`: first check descriptor address, offset, length, and
   Mooncake write path.
