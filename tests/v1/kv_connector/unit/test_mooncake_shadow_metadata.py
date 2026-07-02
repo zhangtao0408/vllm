@@ -240,16 +240,26 @@ def test_shadow_transfer_uses_logical_group_blocks(tmp_path):
     )
 
     assert err is None
-    assert len(src_ptrs) == 128
-    assert lengths == [584] * 128
-    assert src_ptrs[0] == 0x100000 + 10 * 40960
+    assert len(src_ptrs) == 384
+    assert lengths == [448, 128, 8] * 128
+    assert src_ptrs[0] == 0x100000 + 10 * 40960 + 128
     assert dst_ptrs[0] == 0x300000 + 30 * 37440
+    assert src_ptrs[1] == 0x100000 + 10 * 40960
+    assert dst_ptrs[1] == 0x300000 + 30 * 37440 + 448
+    assert src_ptrs[2] == 0x100000 + 10 * 40960 + 576
+    assert dst_ptrs[2] == 0x300000 + 30 * 37440 + 64 * 576
+    assert src_ptrs[3] == 0x100000 + 10 * 40960 + 640 + 128
+    assert dst_ptrs[3] == 0x300000 + 30 * 37440 + 576
     assert debug_descriptors[0].source_layer == "model.layers.2.self_attn.attn"
     assert debug_descriptors[0].target_layers == ("model.layers.2.attn",)
-    assert src_ptrs[64] == 0x200000 + 20 * 40960
-    assert dst_ptrs[64] == 0x300000 + 40 * 37440
-    assert debug_descriptors[64].source_layer == ("model.layers.0.self_attn.swa_cache")
-    assert debug_descriptors[64].target_layers == ("model.layers.0.attn.swa_cache",)
+    assert src_ptrs[192] == 0x200000 + 20 * 40960 + 128
+    assert dst_ptrs[192] == 0x300000 + 40 * 37440
+    assert debug_descriptors[192].source_layer == (
+        "model.layers.0.self_attn.swa_cache"
+    )
+    assert debug_descriptors[192].target_layers == (
+        "model.layers.0.attn.swa_cache",
+    )
 
 
 def test_shadow_transfer_uses_target_layer_materialized_len(tmp_path):
@@ -333,6 +343,113 @@ def test_shadow_transfer_uses_target_layer_materialized_len(tmp_path):
     )
 
     assert err is None
-    assert len(src_ptrs) == 64
-    assert lengths == [584] * 64
+    assert len(src_ptrs) == 192
+    assert lengths == [448, 128, 8] * 64
     assert debug_descriptors[0].target_block_len == 37376
+
+
+def test_shadow_transfer_reorders_compact_c128_bucket(tmp_path):
+    worker = object.__new__(ShadowTransferTestWorker)
+    worker.tp_rank = 0
+    worker.xfer_debug_config = XferDebugConfig(dump_dir=tmp_path)
+    worker.shadow_bucket_plan = (
+        ShadowPlacement(
+            target_page_size=1728,
+            target_slot_idx=0,
+            target_layer_names=("model.layers.3.attn",),
+            source=ShadowSource(
+                page_size=40960,
+                slot_idx=0,
+                layer_name="model.layers.3.self_attn.attn",
+            ),
+            source_bucket_keys=((40960, 0),),
+            layer_mappings=(
+                ShadowLayerMapping(
+                    target_layer_name="model.layers.3.attn",
+                    source=ShadowSource(
+                        page_size=40960,
+                        slot_idx=0,
+                        layer_name="model.layers.3.self_attn.attn",
+                    ),
+                ),
+            ),
+        ),
+    )
+    worker.shadow_sources_by_layer = {
+        "model.layers.3.attn": ShadowTransferSource(
+            layer_name="model.layers.3.self_attn.attn",
+            base_addr=0x100000,
+            block_len=40960,
+            kv_block_len=40960,
+            materialized_block_len=40960,
+            group_idx=0,
+        ),
+    }
+    send_meta = SendBlockMeta(
+        p_req_id="p",
+        transfer_id="xfer",
+        local_block_ids=[[10]],
+        ready=asyncio.Event(),
+    )
+    agent_meta = MooncakeXferMetadata(
+        remote_hostname="h20",
+        remote_port=1234,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={"d": ("xfer", [[30]])},
+        kv_caches_base_addr=[0x300000],
+        block_lens=[1728],
+        kv_cache_group_layer_names=[["model.layers.3.attn"]],
+        kv_cache_group_block_lens=[1728],
+        kv_cache_layer_materialized_block_lens={
+            "model.layers.3.attn": 1168,
+        },
+    )
+    src_ptrs: list[int] = []
+    dst_ptrs: list[int] = []
+    lengths: list[int] = []
+    debug_descriptors = []
+
+    err = worker._append_shadow_transfer_params(
+        d_req_id="d",
+        send_meta=send_meta,
+        remote_block_ids_per_group=agent_meta.req_blocks["d"][1],
+        agent_meta=agent_meta,
+        remote_regions=[
+            TransferRegion(
+                base_addr=0x300000,
+                block_len=1728,
+                kv_block_len=1728,
+            )
+        ],
+        src_ptrs=src_ptrs,
+        dst_ptrs=dst_ptrs,
+        lengths=lengths,
+        debug_descriptors=debug_descriptors,
+    )
+
+    row_62 = 62 * 640
+    row_63 = 63 * 640
+    remote_block_base = 0x300000 + 30 * 1728
+    source_block_base = 0x100000 + 10 * 40960
+
+    assert err is None
+    assert len(src_ptrs) == 6
+    assert lengths == [448, 128, 8] * 2
+    assert src_ptrs == [
+        source_block_base + row_62 + 128,
+        source_block_base + row_62,
+        source_block_base + row_62 + 576,
+        source_block_base + row_63 + 128,
+        source_block_base + row_63,
+        source_block_base + row_63 + 576,
+    ]
+    assert dst_ptrs == [
+        remote_block_base,
+        remote_block_base + 448,
+        remote_block_base + 2 * 576,
+        remote_block_base + 576,
+        remote_block_base + 576 + 448,
+        remote_block_base + 2 * 576 + 8,
+    ]
+    assert debug_descriptors[0].target_block_len == 1168

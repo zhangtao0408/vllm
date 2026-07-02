@@ -1593,24 +1593,24 @@ class MooncakeConnectorWorker:
             local_group = local_group[-len(remote_group) :]
         return list(local_group), list(remote_group), None
 
-    def _get_shadow_row_copy_plan(
+    def _get_shadow_mla_reorder_plan(
         self,
         source: ShadowTransferSource,
         remote_region: TransferRegion,
         target_block_len: int,
-    ) -> tuple[int, int, int, int, int] | None:
+    ) -> tuple[int, int] | None:
         if (
             source.block_len == 40960
             and remote_region.block_len == 37440
             and target_block_len == 37376
         ):
-            return 0, 64, 640, 584, 584
+            return 0, 64
         if (
             source.block_len == 40960
             and remote_region.block_len == 1728
             and target_block_len == 1168
         ):
-            return 62, 2, 640, 584, 584
+            return 62, 2
         return None
 
     def _append_shadow_copy_descriptor(
@@ -1701,47 +1701,73 @@ class MooncakeConnectorWorker:
         if not should_transfer:
             return None
 
-        row_plan = self._get_shadow_row_copy_plan(
+        mla_reorder_plan = self._get_shadow_mla_reorder_plan(
             source, remote_region, target_block_len
         )
-        if row_plan is not None:
+        if mla_reorder_plan is not None:
             if src_offset != 0 or dst_offset != 0:
-                return "Mooncake shadow row-slice transfer does not support TP offsets."
-            start_row, rows, src_row_len, dst_row_len, row_copy_len = row_plan
+                return (
+                    "Mooncake shadow MLA reorder transfer does not support TP "
+                    "offsets."
+                )
+            start_row, rows = mla_reorder_plan
+            src_row_len = 640
+            dst_data_row_len = 576
+            dst_scale_row_len = 8
+            dst_scale_base = rows * dst_data_row_len
+            # A5 stores each 640-byte MLA row as:
+            #   [128B rope bf16][448B nope fp8][8B UE8M0 scales][56B pad].
+            # H20 fp8_ds_mla consumes each block as:
+            #   data plane [rows][448B nope fp8 + 128B rope bf16],
+            #   then scale plane [rows][8B UE8M0 scales].
+            row_segments = (
+                (128, 0, 448, False),
+                (0, 448, 128, False),
+                (576, 0, dst_scale_row_len, True),
+            )
             for block_ordinal, (local_block_id, remote_block_id) in enumerate(
                 zip(local_block_ids, remote_block_ids)
             ):
                 for row in range(start_row, start_row + rows):
-                    src_region_offset = row * src_row_len
-                    dst_region_offset = (row - start_row) * dst_row_len
-                    self._append_shadow_copy_descriptor(
-                        src_ptrs=src_ptrs,
-                        dst_ptrs=dst_ptrs,
-                        lengths=lengths,
-                        debug_descriptors=debug_descriptors,
-                        transfer_id=transfer_id,
-                        d_req_id=d_req_id,
-                        region_idx=region_idx,
-                        source=source,
-                        target_layer_name=target_layer_name,
-                        src_ptr=(
-                            source.base_addr
-                            + local_block_id * source.block_len
-                            + src_region_offset
-                        ),
-                        dst_ptr=(
-                            remote_region.base_addr
-                            + remote_block_id * remote_region.block_len
-                            + dst_region_offset
-                        ),
-                        length=row_copy_len,
-                        src_region_offset=src_region_offset,
-                        dst_region_offset=dst_region_offset,
-                        local_block_id=local_block_id,
-                        remote_block_id=remote_block_id,
-                        block_ordinal=block_ordinal,
-                        target_block_len=target_block_len,
-                    )
+                    dst_row = row - start_row
+                    for src_in_row, dst_in_row, length, is_scale in row_segments:
+                        src_region_offset = row * src_row_len + src_in_row
+                        if is_scale:
+                            dst_region_offset = (
+                                dst_scale_base + dst_row * dst_scale_row_len
+                            )
+                        else:
+                            dst_region_offset = (
+                                dst_row * dst_data_row_len + dst_in_row
+                            )
+                        self._append_shadow_copy_descriptor(
+                            src_ptrs=src_ptrs,
+                            dst_ptrs=dst_ptrs,
+                            lengths=lengths,
+                            debug_descriptors=debug_descriptors,
+                            transfer_id=transfer_id,
+                            d_req_id=d_req_id,
+                            region_idx=region_idx,
+                            source=source,
+                            target_layer_name=target_layer_name,
+                            src_ptr=(
+                                source.base_addr
+                                + local_block_id * source.block_len
+                                + src_region_offset
+                            ),
+                            dst_ptr=(
+                                remote_region.base_addr
+                                + remote_block_id * remote_region.block_len
+                                + dst_region_offset
+                            ),
+                            length=length,
+                            src_region_offset=src_region_offset,
+                            dst_region_offset=dst_region_offset,
+                            local_block_id=local_block_id,
+                            remote_block_id=remote_block_id,
+                            block_ordinal=block_ordinal,
+                            target_block_len=target_block_len,
+                        )
             return None
 
         copy_len = min(
