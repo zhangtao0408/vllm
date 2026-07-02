@@ -332,6 +332,41 @@ def test_compare_xfer_debug_detects_byte_and_golden_mismatch(tmp_path: Path):
     assert golden_results[0].max_abs > 0
 
 
+def test_compare_xfer_debug_matches_payload_when_wire_ids_differ(tmp_path: Path):
+    prefill_dir = tmp_path / "prefill"
+    decode_dir = tmp_path / "decode"
+    prefill_dir.mkdir()
+    decode_dir.mkdir()
+
+    prefill_descriptor = _descriptor()
+    decode_descriptor = {
+        **prefill_descriptor,
+        "transfer_id": "decode-local-transfer",
+        "d_req_id": "decode-local-request",
+        "descriptor_idx": 9,
+    }
+    _save_record(
+        prefill_dir / "p.pt",
+        "producer",
+        prefill_descriptor,
+        b"\x01\x02\x03\x04",
+    )
+    _save_record(
+        decode_dir / "d.pt",
+        "consumer",
+        decode_descriptor,
+        b"\x01\x02\x03\x04",
+    )
+
+    byte_results = compare_prefill_decode(
+        load_records(prefill_dir), load_records(decode_dir)
+    )
+
+    assert len(byte_results) == 1
+    assert byte_results[0].equal is True
+    assert byte_results[0].key[0] == "payload"
+
+
 def test_compare_xfer_debug_ignores_padding_for_golden_stats(tmp_path: Path):
     decode_dir = tmp_path / "decode"
     golden_dir = tmp_path / "golden"
@@ -393,6 +428,48 @@ def test_compare_xfer_debug_expands_decode_logical_aliases(tmp_path: Path):
         {**descriptor, "target_layers": ("layer.alias1",)},
         b"\x01\x02\x00\x04",
         logical_tensor_names=("layer.alias1",),
+    )
+
+    golden_results = compare_decode_golden(
+        load_records(decode_dir), load_records(golden_dir)
+    )
+
+    assert [result.key for result in golden_results] == [
+        (0, "layer.alias0", 0),
+        (0, "layer.alias1", 0),
+    ]
+    assert golden_results[0].allclose is True
+    assert golden_results[1].max_abs is not None
+    assert golden_results[1].max_abs > 0
+
+
+def test_compare_xfer_debug_expands_descriptor_target_layers_without_record_aliases(
+    tmp_path: Path,
+):
+    decode_dir = tmp_path / "decode"
+    golden_dir = tmp_path / "golden"
+    decode_dir.mkdir()
+    golden_dir.mkdir()
+
+    descriptor = _descriptor()
+    descriptor["target_layers"] = ("layer.primary", "layer.alias0", "layer.alias1")
+    _save_record(
+        decode_dir / "d.pt",
+        "consumer",
+        descriptor,
+        b"\x01\x02\x03\x04",
+    )
+    _save_record(
+        golden_dir / "g0.pt",
+        "golden",
+        {**descriptor, "target_layers": ("layer.alias0",)},
+        b"\x01\x02\x03\x04",
+    )
+    _save_record(
+        golden_dir / "g1.pt",
+        "golden",
+        {**descriptor, "target_layers": ("layer.alias1",)},
+        b"\x01\x02\x00\x04",
     )
 
     golden_results = compare_decode_golden(

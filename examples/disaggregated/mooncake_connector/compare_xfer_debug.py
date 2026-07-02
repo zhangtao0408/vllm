@@ -13,7 +13,7 @@ import torch
 
 @dataclass(frozen=True)
 class ByteComparison:
-    key: tuple[str, str, int, int]
+    key: tuple[str, ...]
     equal: bool
     p_sha256: str
     d_sha256: str
@@ -48,33 +48,59 @@ def compare_prefill_decode(
     prefill_records: Iterable[dict[str, Any]],
     decode_records: Iterable[dict[str, Any]],
 ) -> list[ByteComparison]:
-    producer = {
-        _descriptor_key(record): record
-        for record in prefill_records
-        if record.get("side") == "producer"
-    }
-    consumer = {
-        _descriptor_key(record): record
-        for record in decode_records
-        if record.get("side") == "consumer"
-    }
+    producer = [
+        record for record in prefill_records if record.get("side") == "producer"
+    ]
+    consumer = [
+        record for record in decode_records if record.get("side") == "consumer"
+    ]
+    consumer_by_key: dict[tuple[str, ...], list[tuple[int, dict[str, Any]]]] = {}
+    for idx, record in enumerate(consumer):
+        for key in _prefill_decode_keys(record):
+            consumer_by_key.setdefault(key, []).append((idx, record))
+
     comparisons: list[ByteComparison] = []
-    for key in sorted(producer.keys() & consumer.keys()):
-        p_bytes = _payload_bytes(producer[key])
-        d_bytes = _payload_bytes(consumer[key])
+    matched_producer_indexes: set[int] = set()
+    matched_consumer_indexes: set[int] = set()
+    for producer_idx, producer_record in enumerate(producer):
+        matched_key: tuple[str, ...] | None = None
+        matched_consumer: dict[str, Any] | None = None
+        for key in _prefill_decode_keys(producer_record):
+            for consumer_idx, consumer_record in consumer_by_key.get(key, ()):
+                if consumer_idx not in matched_consumer_indexes:
+                    matched_key = key
+                    matched_consumer = consumer_record
+                    matched_consumer_indexes.add(consumer_idx)
+                    break
+            if matched_consumer is not None:
+                break
+        if matched_key is None or matched_consumer is None:
+            continue
+
+        matched_producer_indexes.add(producer_idx)
+        p_bytes = _payload_bytes(producer_record)
+        d_bytes = _payload_bytes(matched_consumer)
         comparisons.append(
             ByteComparison(
-                key=key,
+                key=matched_key,
                 equal=p_bytes == d_bytes,
-                p_sha256=str(producer[key]["payload_sha256"]),
-                d_sha256=str(consumer[key]["payload_sha256"]),
+                p_sha256=str(producer_record["payload_sha256"]),
+                d_sha256=str(matched_consumer["payload_sha256"]),
                 p_len=len(p_bytes),
                 d_len=len(d_bytes),
                 first_diff=_first_diff(p_bytes, d_bytes),
             )
         )
-    missing_decode = sorted(producer.keys() - consumer.keys())
-    missing_prefill = sorted(consumer.keys() - producer.keys())
+    missing_decode = [
+        _diagnostic_key(record)
+        for idx, record in enumerate(producer)
+        if idx not in matched_producer_indexes
+    ]
+    missing_prefill = [
+        _diagnostic_key(record)
+        for idx, record in enumerate(consumer)
+        if idx not in matched_consumer_indexes
+    ]
     _print_missing("decode", missing_decode)
     _print_missing("prefill", missing_prefill)
     return comparisons
@@ -141,13 +167,46 @@ def main() -> int:
     return 1 if failed_bytes else 0
 
 
-def _descriptor_key(record: dict[str, Any]) -> tuple[str, str, int, int]:
+def _prefill_decode_keys(record: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
+    descriptor = record["descriptor"]
+    block_ordinals = ",".join(str(int(item)) for item in descriptor["block_ordinals"])
+    keys: list[tuple[str, ...]] = [_descriptor_key(record)]
+    for tensor_name in _logical_tensor_names(record):
+        keys.append(
+            (
+                "payload",
+                str(int(descriptor["tp_rank"])),
+                _canonical_tensor_name(tensor_name),
+                block_ordinals,
+                str(int(descriptor["length"])),
+                str(int(descriptor["target_block_len"])),
+                str(descriptor["bucket_type"]),
+            )
+        )
+    return tuple(dict.fromkeys(keys))
+
+
+def _descriptor_key(record: dict[str, Any]) -> tuple[str, ...]:
     descriptor = record["descriptor"]
     return (
+        "descriptor",
         str(descriptor["transfer_id"]),
         str(descriptor["d_req_id"]),
-        int(descriptor["tp_rank"]),
-        int(descriptor["descriptor_idx"]),
+        str(int(descriptor["tp_rank"])),
+        str(int(descriptor["descriptor_idx"])),
+    )
+
+
+def _diagnostic_key(record: dict[str, Any]) -> tuple[str, ...]:
+    descriptor = record["descriptor"]
+    names = ",".join(_logical_tensor_names(record))
+    ordinals = ",".join(str(int(item)) for item in descriptor["block_ordinals"])
+    return (
+        str(int(descriptor["tp_rank"])),
+        names,
+        ordinals,
+        str(int(descriptor["length"])),
+        str(descriptor["bucket_type"]),
     )
 
 
@@ -186,11 +245,22 @@ def _logical_tensor_names(record: dict[str, Any]) -> tuple[str, ...]:
         isinstance(name, str) for name in names
     ):
         return tuple(names)
+    descriptor = record["descriptor"]
+    target_layers = descriptor.get("target_layers")
+    if isinstance(target_layers, (list, tuple)) and all(
+        isinstance(name, str) for name in target_layers
+    ):
+        return tuple(target_layers)
     tensor_name = record.get("tensor_name")
     if isinstance(tensor_name, str):
         return (tensor_name,)
-    descriptor = record["descriptor"]
     return (str(descriptor["region_idx"]),)
+
+
+def _canonical_tensor_name(tensor_name: str) -> str:
+    return tensor_name.replace(".self_attn.attn", ".attn").replace(
+        ".self_attn.", ".attn."
+    )
 
 
 def _payload_bytes(record: dict[str, Any]) -> bytes:
@@ -290,7 +360,7 @@ def _print_golden_results(results: list[GoldenComparison]) -> None:
         )
 
 
-def _print_missing(side: str, keys: list[tuple[str, str, int, int]]) -> None:
+def _print_missing(side: str, keys: list[tuple[str, ...]]) -> None:
     if keys:
         print(f"Missing {side} records for {len(keys)} descriptor(s): {keys[:8]}")
 
