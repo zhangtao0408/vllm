@@ -1869,6 +1869,10 @@ class MooncakeConnectorWorker:
         producer_buckets = bucket_slots_from_kv_cache_tensors(
             self.kv_cache_config.kv_cache_tensors, self.num_blocks
         )
+        producer_bucket_layer_names = {
+            (bucket.page_size, bucket.slot_idx): bucket.layer_names
+            for bucket in producer_buckets
+        }
         consumer_buckets = parse_shadow_buckets(self._get_shadow_buckets_config())
         placements = build_shadow_bucket_plan(producer_buckets, consumer_buckets)
 
@@ -1887,21 +1891,22 @@ class MooncakeConnectorWorker:
                     placement.source_bucket_keys,
                     (placement.source.page_size, placement.source.slot_idx),
                 )
-            source_metadata = source_metadata_by_name.get(placement.source.layer_name)
-            if source_metadata is None:
+            source_bucket_key = (placement.source.page_size, placement.source.slot_idx)
+            source_layer_names = producer_bucket_layer_names[source_bucket_key]
+            source_metadata = [
+                metadata
+                for layer_name in source_layer_names
+                for metadata in source_metadata_by_name.get(layer_name, ())
+            ]
+            if not source_metadata:
                 raise RuntimeError(
                     "Mooncake shadow bucket source cache is absent from kv_caches: "
                     f"{placement.source.layer_name!r}."
                 )
-            if len(source_metadata) != 1:
-                raise RuntimeError(
-                    "Mooncake shadow bucket currently supports one tensor per "
-                    "source logical cache, but "
-                    f"{placement.source.layer_name!r} has "
-                    f"{len(source_metadata)} tensors."
-                )
-            shadow_base_addrs.append(source_metadata[0].base_addr)
-            source_block_lens.append(source_metadata[0].block_len)
+            shadow_base_addrs.append(
+                min(metadata.base_addr for metadata in source_metadata)
+            )
+            source_block_lens.append(placement.source.page_size)
             target_block_lens.append(placement.target_page_size)
 
         logger.info(
