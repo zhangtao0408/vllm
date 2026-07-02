@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.shadow_bucket import 
     ShadowPlacement,
     bucket_slots_from_kv_cache_tensors,
     build_shadow_bucket_plan,
+    canonical_cache_name,
     parse_shadow_buckets,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
@@ -109,6 +110,17 @@ class TransferRegion:
 class KVCacheAddressMetadata:
     base_addr: int
     block_len: int
+    materialized_block_len: int = 0
+
+
+@dataclass(frozen=True)
+class ShadowTransferSource:
+    layer_name: str
+    base_addr: int
+    block_len: int
+    kv_block_len: int
+    materialized_block_len: int
+    group_idx: int
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -396,6 +408,8 @@ class MooncakeXferMetadata(
     req_blocks: dict[ReqId, tuple[TransferId, list[list[int]]]]
     kv_caches_base_addr: list[int]
     block_lens: list[int]
+    kv_cache_group_layer_names: list[list[str]] = msgspec.field(default_factory=list)
+    kv_cache_group_block_lens: list[int] = msgspec.field(default_factory=list)
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -486,9 +500,9 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
 
         if role == KVConnectorRole.SCHEDULER:
-            assert kv_cache_config is not None, (
-                "kv_cache_config is required for SCHEDULER role"
-            )
+            assert (
+                kv_cache_config is not None
+            ), "kv_cache_config is required for SCHEDULER role"
             self.connector_scheduler: MooncakeConnectorScheduler | None = (
                 MooncakeConnectorScheduler(vllm_config, self.engine_id, kv_cache_config)
             )
@@ -882,6 +896,10 @@ class MooncakeConnectorWorker:
         self.hostname = get_ip()
         self.shadow_block_len_per_layer: list[int] = []
         self.shadow_bucket_plan: tuple[ShadowPlacement, ...] = ()
+        self.shadow_sources_by_layer: dict[str, ShadowTransferSource] = {}
+        self.kv_cache_group_layer_names: list[list[str]] = []
+        self.kv_cache_group_block_lens: list[int] = []
+        self.layer_to_group_index: dict[str, int] = {}
 
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.xfer_debug_config: XferDebugConfig | None = parse_xfer_debug_config(
@@ -1550,6 +1568,285 @@ class MooncakeConnectorWorker:
         )
         return list(local_block_ids), list(remote_block_ids), None
 
+    def _get_remote_layer_to_group_index(
+        self,
+        group_layer_names: list[list[str]],
+    ) -> dict[str, int]:
+        layer_to_group: dict[str, int] = {}
+        for group_idx, layer_names in enumerate(group_layer_names):
+            for layer_name in layer_names:
+                layer_to_group[canonical_cache_name(layer_name)] = group_idx
+        return layer_to_group
+
+    def _trim_shadow_group_blocks(
+        self,
+        local_group: list[int],
+        remote_group: list[int],
+    ) -> tuple[list[int], list[int], str | None]:
+        if len(local_group) < len(remote_group):
+            return [], [], "P num blocks less than D"
+        if len(local_group) > len(remote_group):
+            local_group = local_group[-len(remote_group) :]
+        return list(local_group), list(remote_group), None
+
+    def _get_shadow_row_copy_plan(
+        self,
+        source: ShadowTransferSource,
+        remote_region: TransferRegion,
+        target_block_len: int,
+    ) -> tuple[int, int, int, int, int] | None:
+        if (
+            source.block_len == 40960
+            and remote_region.block_len == 37440
+            and target_block_len == 37376
+        ):
+            return 0, 64, 640, 584, 584
+        if (
+            source.block_len == 40960
+            and remote_region.block_len == 1728
+            and target_block_len == 1168
+        ):
+            return 62, 2, 640, 584, 584
+        return None
+
+    def _append_shadow_copy_descriptor(
+        self,
+        *,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        debug_descriptors: list[XferDebugDescriptor],
+        transfer_id: TransferId,
+        d_req_id: ReqId,
+        region_idx: int,
+        source: ShadowTransferSource,
+        target_layer_name: str,
+        src_ptr: int,
+        dst_ptr: int,
+        length: int,
+        src_region_offset: int,
+        dst_region_offset: int,
+        local_block_id: int,
+        remote_block_id: int,
+        block_ordinal: int,
+        target_block_len: int,
+    ) -> None:
+        if self.xfer_debug_config is not None:
+            region_info = XferDebugRegionInfo(
+                source_layer=source.layer_name,
+                target_layers=(target_layer_name,),
+                source_block_len=source.materialized_block_len,
+                target_block_len=target_block_len,
+            )
+            debug_descriptors.append(
+                XferDebugDescriptor(
+                    transfer_id=transfer_id,
+                    d_req_id=d_req_id,
+                    tp_rank=self.tp_rank,
+                    descriptor_idx=len(src_ptrs),
+                    region_idx=region_idx,
+                    block_id=remote_block_id,
+                    local_block_id=local_block_id,
+                    remote_block_id=remote_block_id,
+                    local_block_ids=(local_block_id,),
+                    remote_block_ids=(remote_block_id,),
+                    block_ordinals=(block_ordinal,),
+                    src_ptr=src_ptr,
+                    dst_ptr=dst_ptr,
+                    length=length,
+                    src_offset=src_region_offset,
+                    dst_offset=dst_region_offset,
+                    source_layer=source.layer_name,
+                    target_layers=(target_layer_name,),
+                    source_block_len=source.materialized_block_len,
+                    target_block_len=target_block_len,
+                    bucket_type=region_info.bucket_type,
+                )
+            )
+        src_ptrs.append(src_ptr)
+        dst_ptrs.append(dst_ptr)
+        lengths.append(length)
+
+    def _append_shadow_block_transfers(
+        self,
+        *,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        debug_descriptors: list[XferDebugDescriptor],
+        transfer_id: TransferId,
+        d_req_id: ReqId,
+        region_idx: int,
+        source: ShadowTransferSource,
+        target_layer_name: str,
+        remote_region: TransferRegion,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        target_block_len: int,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> str | None:
+        should_transfer, src_offset, dst_offset, transfer_len = (
+            self._get_sender_transfer_plan(
+                local_kv_block_len=source.kv_block_len,
+                remote_kv_block_len=remote_region.kv_block_len,
+                remote_tp_rank=remote_tp_rank,
+                remote_tp_size=remote_tp_size,
+            )
+        )
+        if not should_transfer:
+            return None
+
+        row_plan = self._get_shadow_row_copy_plan(
+            source, remote_region, target_block_len
+        )
+        if row_plan is not None:
+            if src_offset != 0 or dst_offset != 0:
+                return "Mooncake shadow row-slice transfer does not support TP offsets."
+            start_row, rows, src_row_len, dst_row_len, row_copy_len = row_plan
+            for block_ordinal, (local_block_id, remote_block_id) in enumerate(
+                zip(local_block_ids, remote_block_ids)
+            ):
+                for row in range(start_row, start_row + rows):
+                    src_region_offset = row * src_row_len
+                    dst_region_offset = (row - start_row) * dst_row_len
+                    self._append_shadow_copy_descriptor(
+                        src_ptrs=src_ptrs,
+                        dst_ptrs=dst_ptrs,
+                        lengths=lengths,
+                        debug_descriptors=debug_descriptors,
+                        transfer_id=transfer_id,
+                        d_req_id=d_req_id,
+                        region_idx=region_idx,
+                        source=source,
+                        target_layer_name=target_layer_name,
+                        src_ptr=(
+                            source.base_addr
+                            + local_block_id * source.block_len
+                            + src_region_offset
+                        ),
+                        dst_ptr=(
+                            remote_region.base_addr
+                            + remote_block_id * remote_region.block_len
+                            + dst_region_offset
+                        ),
+                        length=row_copy_len,
+                        src_region_offset=src_region_offset,
+                        dst_region_offset=dst_region_offset,
+                        local_block_id=local_block_id,
+                        remote_block_id=remote_block_id,
+                        block_ordinal=block_ordinal,
+                        target_block_len=target_block_len,
+                    )
+            return None
+
+        copy_len = min(
+            transfer_len,
+            source.materialized_block_len,
+            target_block_len,
+            source.kv_block_len - src_offset,
+            remote_region.kv_block_len - dst_offset,
+        )
+        for block_ordinal, (local_block_id, remote_block_id) in enumerate(
+            zip(local_block_ids, remote_block_ids)
+        ):
+            self._append_shadow_copy_descriptor(
+                src_ptrs=src_ptrs,
+                dst_ptrs=dst_ptrs,
+                lengths=lengths,
+                debug_descriptors=debug_descriptors,
+                transfer_id=transfer_id,
+                d_req_id=d_req_id,
+                region_idx=region_idx,
+                source=source,
+                target_layer_name=target_layer_name,
+                src_ptr=(
+                    source.base_addr + local_block_id * source.block_len + src_offset
+                ),
+                dst_ptr=(
+                    remote_region.base_addr
+                    + remote_block_id * remote_region.block_len
+                    + dst_offset
+                ),
+                length=copy_len,
+                src_region_offset=src_offset,
+                dst_region_offset=dst_offset,
+                local_block_id=local_block_id,
+                remote_block_id=remote_block_id,
+                block_ordinal=block_ordinal,
+                target_block_len=target_block_len,
+            )
+        return None
+
+    def _append_shadow_transfer_params(
+        self,
+        *,
+        d_req_id: ReqId,
+        send_meta: SendBlockMeta,
+        remote_block_ids_per_group: list[list[int]],
+        agent_meta: MooncakeXferMetadata,
+        remote_regions: list[TransferRegion],
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        debug_descriptors: list[XferDebugDescriptor],
+    ) -> str | None:
+        remote_layer_to_group_index = self._get_remote_layer_to_group_index(
+            agent_meta.kv_cache_group_layer_names
+        )
+        if not remote_layer_to_group_index:
+            return "Mooncake shadow bucket requires remote KV group metadata."
+
+        for region_idx, (placement, remote_region) in enumerate(
+            zip(self.shadow_bucket_plan, remote_regions)
+        ):
+            for layer_mapping in placement.layer_mappings:
+                source_key = canonical_cache_name(layer_mapping.source.layer_name)
+                target_key = canonical_cache_name(layer_mapping.target_layer_name)
+                source = self.shadow_sources_by_layer.get(source_key)
+                remote_group_idx = remote_layer_to_group_index.get(target_key)
+                if source is None or remote_group_idx is None:
+                    continue
+                if source.group_idx >= len(send_meta.local_block_ids):
+                    continue
+                if remote_group_idx >= len(remote_block_ids_per_group):
+                    continue
+                target_block_len = (
+                    agent_meta.kv_cache_group_block_lens[remote_group_idx]
+                    if remote_group_idx < len(agent_meta.kv_cache_group_block_lens)
+                    else remote_region.kv_block_len
+                )
+                local_block_ids, remote_block_ids, block_error = (
+                    self._trim_shadow_group_blocks(
+                        send_meta.local_block_ids[source.group_idx],
+                        remote_block_ids_per_group[remote_group_idx],
+                    )
+                )
+                if block_error is not None:
+                    return block_error
+                if not local_block_ids:
+                    continue
+                append_error = self._append_shadow_block_transfers(
+                    src_ptrs=src_ptrs,
+                    dst_ptrs=dst_ptrs,
+                    lengths=lengths,
+                    debug_descriptors=debug_descriptors,
+                    transfer_id=send_meta.transfer_id,
+                    d_req_id=d_req_id,
+                    region_idx=region_idx,
+                    source=source,
+                    target_layer_name=layer_mapping.target_layer_name,
+                    remote_region=remote_region,
+                    local_block_ids=local_block_ids,
+                    remote_block_ids=remote_block_ids,
+                    target_block_len=target_block_len,
+                    remote_tp_rank=agent_meta.remote_tp_rank,
+                    remote_tp_size=agent_meta.remote_tp_size,
+                )
+                if append_error is not None:
+                    return append_error
+        return None
+
     async def _build_transfer_params(
         self,
         ready_reqs: list[tuple[ReqId, SendBlockMeta]],
@@ -1578,6 +1875,25 @@ class MooncakeConnectorWorker:
             if not remote_block_ids_per_group or all(
                 len(g) == 0 for g in remote_block_ids_per_group
             ):
+                continue
+
+            if self.shadow_bucket_plan and agent_meta.kv_cache_group_layer_names:
+                shadow_error = self._append_shadow_transfer_params(
+                    d_req_id=d_req_id,
+                    send_meta=send_meta,
+                    remote_block_ids_per_group=remote_block_ids_per_group,
+                    agent_meta=agent_meta,
+                    remote_regions=remote_regions,
+                    src_ptrs=src_ptrs,
+                    dst_ptrs=dst_ptrs,
+                    lengths=lengths,
+                    debug_descriptors=debug_descriptors,
+                )
+                if shadow_error is not None:
+                    logger.error("req %s: %s", d_req_id, shadow_error)
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = shadow_error
                 continue
 
             # Per-group partial hit trimming, then flatten.
@@ -1680,12 +1996,12 @@ class MooncakeConnectorWorker:
                         transfer_len=transfer_len,
                     )
 
-                assert src_region_offset + transfer_len <= local_region.kv_block_len, (
-                    "Computed source transfer region exceeds local KV block size."
-                )
-                assert dst_region_offset + transfer_len <= remote_region.kv_block_len, (
-                    "Computed destination transfer region exceeds remote KV block size."
-                )
+                assert (
+                    src_region_offset + transfer_len <= local_region.kv_block_len
+                ), "Computed source transfer region exceeds local KV block size."
+                assert (
+                    dst_region_offset + transfer_len <= remote_region.kv_block_len
+                ), "Computed destination transfer region exceeds remote KV block size."
                 # Collapse one contiguous block group into a single larger
                 # transfer descriptor when the per-block copy is identical.
                 can_coalesce = _can_coalesce_block_transfers(
@@ -1857,6 +2173,38 @@ class MooncakeConnectorWorker:
     def _should_use_shadow_bucket_metadata(self) -> bool:
         return self.is_kv_producer and self._get_shadow_buckets_config() is not None
 
+    def _build_kv_cache_group_metadata(
+        self,
+        source_metadata_by_name: dict[str, list[KVCacheAddressMetadata]],
+    ) -> None:
+        if self.kv_cache_config is None:
+            self.kv_cache_group_layer_names = []
+            self.kv_cache_group_block_lens = []
+            self.layer_to_group_index = {}
+            return
+
+        group_layer_names: list[list[str]] = []
+        group_block_lens: list[int] = []
+        layer_to_group_index: dict[str, int] = {}
+        for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            group_layer_names.append(list(group.layer_names))
+            group_block_len = 0
+            for layer_name in group.layer_names:
+                layer_to_group_index[canonical_cache_name(layer_name)] = group_idx
+                metadata = source_metadata_by_name.get(layer_name)
+                if metadata and group_block_len == 0:
+                    group_block_len = max(
+                        item.materialized_block_len or item.block_len
+                        for item in metadata
+                    )
+            if group_block_len == 0:
+                group_block_len = int(group.kv_cache_spec.page_size_bytes)
+            group_block_lens.append(group_block_len)
+
+        self.kv_cache_group_layer_names = group_layer_names
+        self.kv_cache_group_block_lens = group_block_lens
+        self.layer_to_group_index = layer_to_group_index
+
     def _build_shadow_bucket_metadata(
         self,
         source_metadata_by_name: dict[str, list[KVCacheAddressMetadata]],
@@ -1879,6 +2227,7 @@ class MooncakeConnectorWorker:
         shadow_base_addrs: list[int] = []
         source_block_lens: list[int] = []
         target_block_lens: list[int] = []
+        shadow_sources_by_layer: dict[str, ShadowTransferSource] = {}
         for placement in placements:
             if len(placement.source_bucket_keys) > 1:
                 logger.warning(
@@ -1890,6 +2239,44 @@ class MooncakeConnectorWorker:
                     placement.target_slot_idx,
                     placement.source_bucket_keys,
                     (placement.source.page_size, placement.source.slot_idx),
+                )
+            for layer_mapping in placement.layer_mappings:
+                source_metadata = source_metadata_by_name.get(
+                    layer_mapping.source.layer_name, ()
+                )
+                if not source_metadata:
+                    raise RuntimeError(
+                        "Mooncake shadow bucket source cache is absent from "
+                        f"kv_caches: {layer_mapping.source.layer_name!r}."
+                    )
+                group_idx = self.layer_to_group_index.get(
+                    canonical_cache_name(layer_mapping.source.layer_name)
+                )
+                if group_idx is None:
+                    raise RuntimeError(
+                        "Mooncake shadow bucket source cache is absent from "
+                        "kv_cache_groups: "
+                        f"{layer_mapping.source.layer_name!r}."
+                    )
+                source_base_addr = min(
+                    metadata.base_addr for metadata in source_metadata
+                )
+                source_block_len = max(
+                    metadata.block_len for metadata in source_metadata
+                )
+                source_materialized_len = max(
+                    metadata.materialized_block_len or metadata.block_len
+                    for metadata in source_metadata
+                )
+                shadow_sources_by_layer[
+                    canonical_cache_name(layer_mapping.source.layer_name)
+                ] = ShadowTransferSource(
+                    layer_name=layer_mapping.source.layer_name,
+                    base_addr=source_base_addr,
+                    block_len=source_block_len,
+                    kv_block_len=source_block_len,
+                    materialized_block_len=source_materialized_len,
+                    group_idx=group_idx,
                 )
             source_bucket_key = (placement.source.page_size, placement.source.slot_idx)
             source_layer_names = producer_bucket_layer_names[source_bucket_key]
@@ -1909,6 +2296,7 @@ class MooncakeConnectorWorker:
             source_block_lens.append(placement.source.page_size)
             target_block_lens.append(placement.target_page_size)
 
+        self.shadow_sources_by_layer = shadow_sources_by_layer
         logger.info(
             "Enabled Mooncake shadow bucket metadata with %d placements. "
             "source_block_lens=%s target_block_lens=%s",
@@ -1989,7 +2377,7 @@ class MooncakeConnectorWorker:
         if isinstance(cache_or_caches, torch.Tensor):
             return list(cache_or_caches) if split_k_and_v else [cache_or_caches]
 
-        if isinstance(cache_or_caches, (list, tuple)):
+        if isinstance(cache_or_caches, list | tuple):
             return list(cache_or_caches)
 
         raise TypeError(
@@ -2026,9 +2414,9 @@ class MooncakeConnectorWorker:
                 if tensor_size_bytes is None:
                     tensor_size_bytes = cache.nbytes
                     self.num_blocks = cache.shape[0]
-                assert cache.shape[0] == self.num_blocks, (
-                    "All kv cache tensors must have the same number of blocks"
-                )
+                assert (
+                    cache.shape[0] == self.num_blocks
+                ), "All kv cache tensors must have the same number of blocks"
 
                 # Use stride-based block length so RDMA reaches the last
                 # block's padding (e.g. DeepseekV4 MLA alignment). stride(0)
@@ -2050,7 +2438,13 @@ class MooncakeConnectorWorker:
                     )
 
                 source_metadata.append(
-                    KVCacheAddressMetadata(base_addr=base_addr, block_len=block_len)
+                    KVCacheAddressMetadata(
+                        base_addr=base_addr,
+                        block_len=block_len,
+                        materialized_block_len=(
+                            cache[0].numel() * cache.element_size()
+                        ),
+                    )
                 )
                 if base_addr in seen_base_addresses:
                     continue
@@ -2066,6 +2460,8 @@ class MooncakeConnectorWorker:
 
             source_metadata_by_name[layer_name] = source_metadata
 
+        self._build_kv_cache_group_metadata(source_metadata_by_name)
+
         if self._should_use_shadow_bucket_metadata():
             (
                 self.kv_caches_base_addr,
@@ -2077,6 +2473,7 @@ class MooncakeConnectorWorker:
             self.kv_caches_base_addr = seen_base_addresses
             self.shadow_block_len_per_layer = []
             self.shadow_bucket_plan = ()
+            self.shadow_sources_by_layer = {}
 
         self.seen_base_addresses = seen_base_addresses
 
@@ -2200,6 +2597,8 @@ class MooncakeConnectorWorker:
             },
             kv_caches_base_addr=self.kv_caches_base_addr,
             block_lens=self.block_len_per_layer,
+            kv_cache_group_layer_names=self.kv_cache_group_layer_names,
+            kv_cache_group_block_lens=self.kv_cache_group_block_lens,
         )
 
         encoded_data = self._encoder.encode(metadata)

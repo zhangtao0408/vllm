@@ -57,3 +57,25 @@ def test_shadow_bucket_plan_keeps_first_logical_source_alias():
         "model.layers.2.self_attn.indexer.k_cache"
     )
     assert placements[1].source.layer_name == "model.layers.2.self_attn.attn"
+    assert [
+        (mapping.target_layer_name, mapping.source.layer_name)
+        for mapping in placements[1].layer_mappings
+    ] == [
+        ("model.layers.2.attn", "model.layers.2.self_attn.attn"),
+        (
+            "model.layers.0.attn.swa_cache",
+            "model.layers.0.self_attn.swa_cache",
+        ),
+        (
+            "model.layers.1.attn.swa_cache",
+            "model.layers.1.self_attn.swa_cache",
+        ),
+        (
+            "model.layers.2.attn.compressor.state_cache",
+            "model.layers.2.self_attn.compressor.state_cache",
+        ),
+        (
+            "model.layers.3.attn.compressor.state_cache",
+            "model.layers.3.self_attn.compressor.state_cache",
+        ),
+    ]

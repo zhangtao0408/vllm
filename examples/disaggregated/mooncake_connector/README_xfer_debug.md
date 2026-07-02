@@ -165,3 +165,100 @@ Each `.pt` record contains the descriptor metadata, payload bytes,
 `payload_sha256`, tensor name, tensor dtype/shape, rank tag, block stride bytes,
 materialized block bytes, `payload_materialized_num_bytes`,
 `payload_padding_num_bytes`, and optional `full_source_block`.
+
+## 7. Build Synthetic H20 Shadow Slices From 950PR Native
+
+Use this after collecting both `ascend_native` and `h20_golden`. It does not
+need H20 or 950PR hardware; it only reads dumped tensors with `torch.load`.
+
+```bash
+python examples/disaggregated/mooncake_connector/synthesize_h20_shadow_from_ascend.py \
+  --ascend-native-dump /tmp/pd_xfer_4l/ascend_native \
+  --h20-golden-dump /tmp/pd_xfer_4l/h20_golden \
+  --output-dump /tmp/pd_xfer_4l/synthetic_h20
+```
+
+The script emits one synthetic record per H20 native golden record and prints a
+comparison table keyed by `(tp_rank, logical_tensor_name, block_ordinal)`.
+Current built-in rules cover the 4-layer DSv4 debug slice:
+
+- `8192 -> 8192` and `32768 -> 32768`: direct copy for compressor state caches.
+- `8192 -> 8448`: diagnostic `indexer.k_cache` candidates for `128 -> 132`.
+- `40960 -> 37376`: row-wise `64 x 640 -> 64 x 584` candidates plus a scanned
+  best column offset for diagnosis.
+- `40960 -> 1168`: C128 compact candidate `last2_first584`, which maps the last
+  two `640`-byte rows to H20's `2 x 584` materialized payload.
+
+Read the output as a conversion diagnosis:
+
+- `allclose=True` means the candidate is a viable byte/numeric layout rule for
+  that dumped prompt.
+- high cosine with small `mean_abs` on float32 state cache usually means the
+  source/target logical cache is correct but backend numeric differences remain.
+- `nan=(left,right,mismatch)` flags NaNs in synthetic/source versus H20 golden;
+  this usually means the source logical view or block group still needs checking.
+
+For `40960 -> 37440` layout work, add `--field-heatmap`:
+
+```bash
+python examples/disaggregated/mooncake_connector/synthesize_h20_shadow_from_ascend.py \
+  --ascend-native-dump /tmp/pd_xfer_4l/ascend_native \
+  --h20-golden-dump /tmp/pd_xfer_4l/h20_golden \
+  --field-heatmap
+```
+
+The heatmap splits H20's `584` materialized bytes into `nope=448`,
+`rope=128`, and `scale=8`, then prints per-field error and the worst rows for
+each `40960 -> 37440` candidate. Use this before collecting new server dumps.
+
+To check SWA source mapping without assuming same-name mapping, add
+`--swa-source-scan`:
+
+```bash
+python examples/disaggregated/mooncake_connector/synthesize_h20_shadow_from_ascend.py \
+  --ascend-native-dump /tmp/pd_xfer_4l/ascend_native \
+  --h20-golden-dump /tmp/pd_xfer_4l/h20_golden \
+  --swa-source-scan \
+  --top-k 8
+```
+
+This scans every 950PR `40960` fp8 source block against each H20
+`*.swa_cache` target and prints the closest source physical name, source tensor
+name, source block ordinal, source block id, and transform candidate.
+
+The scan prints two SWA sections:
+
+- `SWA_TARGET`: global numeric nearest sources across all 950PR `40960` fp8
+  blocks. This is useful for discovering surprising candidates, but sparse
+  SWA blocks can make an unrelated mostly-zero block look close.
+- `SWA_STRUCTURAL_TARGET`: same-name structural candidates, for example H20
+  `model.layers.2.attn.swa_cache` against 950PR
+  `model.layers.2.self_attn.swa_cache`. Treat this as the first semantic
+  mapping check before trusting the global nearest result.
+
+## 8. Next Alignment Order
+
+Use the current dump before collecting new server data. The preferred order is:
+
+1. Continue offline analysis for `40960 -> 37440`.
+   H20's `584` bytes per token means `448 NoPE + 128 RoPE + 8 fp8 scale`, so
+   this should be treated as field-level repacking from 950PR's `64 x 640`
+   block rather than as a contiguous prefix. First add row/field heatmaps to
+   locate whether the remaining error is in NoPE, RoPE, scale, or every field.
+
+2. Then locate `indexer.k_cache 8192 -> 8448`.
+   H20's `132` bytes per token means `128 fp8 + 4 scale`. The extra
+   `256` bytes per block are real scale bytes, not padding. If the current
+   native dump does not contain the scale source, collect a minimal 950PR
+   native dump that includes `indexer_k_cache`, `indexer_scale_cache`, and
+   `indexer_full_cache` when present in the Ascend tuple cache.
+
+3. Finally isolate NaNs in `layer3.compressor.state_cache`.
+   Do not treat this as a numeric tolerance problem. First verify the 950PR
+   source logical view, tuple component, block id, and block group. A minimal
+   950PR native dump with per-component finite/NaN stats is enough; do not rerun
+   the full H20+950PR+PD stack unless the source-side view is confirmed correct.
+
+Only collect new server data after the offline `40960 -> 37440` analysis stops
+making progress or after the missing `indexer` scale/full-cache source needs to
+be proven from runtime tensors.

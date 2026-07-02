@@ -29,12 +29,19 @@ class ShadowSource:
 
 
 @dataclass(frozen=True)
+class ShadowLayerMapping:
+    target_layer_name: str
+    source: ShadowSource
+
+
+@dataclass(frozen=True)
 class ShadowPlacement:
     target_page_size: int
     target_slot_idx: int
     target_layer_names: tuple[str, ...]
     source: ShadowSource
     source_bucket_keys: tuple[tuple[int, int], ...]
+    layer_mappings: tuple[ShadowLayerMapping, ...]
 
 
 @dataclass(frozen=True)
@@ -149,13 +156,20 @@ def build_shadow_bucket_plan(
 
     for target_bucket in consumer_buckets:
         source_candidates: dict[tuple[int, int], ShadowSource] = {}
+        layer_mappings: list[ShadowLayerMapping] = []
         for target_layer_name in target_bucket.layer_names:
             source = producer_slots.get(canonical_cache_name(target_layer_name))
             if source is None:
                 raise MissingSourceCacheError(target_layer_name)
             source_candidates.setdefault((source.page_size, source.slot_idx), source)
+            layer_mappings.append(
+                ShadowLayerMapping(
+                    target_layer_name=target_layer_name,
+                    source=source,
+                )
+            )
 
-        source = next(iter(source_candidates.values()))
+        source = layer_mappings[0].source
         placements.append(
             ShadowPlacement(
                 target_page_size=target_bucket.page_size,
@@ -163,6 +177,7 @@ def build_shadow_bucket_plan(
                 target_layer_names=target_bucket.layer_names,
                 source=source,
                 source_bucket_keys=tuple(source_candidates),
+                layer_mappings=tuple(layer_mappings),
             )
         )
 
