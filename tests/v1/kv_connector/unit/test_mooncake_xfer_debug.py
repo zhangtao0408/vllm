@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import hashlib
+import json
+from pathlib import Path
+from typing import NamedTuple
+
+import torch
+
+from examples.disaggregated.mooncake_connector.compare_xfer_debug import (
+    compare_decode_golden,
+    compare_prefill_decode,
+    load_records,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.xfer_debug import (
+    XferDebugCacheView,
+    XferDebugConfig,
+    XferDebugDescriptor,
+    XferDebugDumpRequest,
+    descriptor_from_dict,
+    descriptor_to_dict,
+    dump_xfer_debug_records,
+    parse_xfer_debug_config,
+)
+from vllm.v1.worker.kv_xfer_debug import (
+    NativeKVCacheDescriptorRequest,
+    build_native_kv_cache_descriptors,
+    build_xfer_debug_cache_views,
+)
+
+
+def test_parse_xfer_debug_config_from_json_path(tmp_path: Path):
+    config_path = tmp_path / "xfer_debug.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "dump_dir": "~/tmp/pd_xfer_4l/h20_golden",
+                "max_requests": 2,
+                "dump_on_prefill": True,
+            }
+        )
+    )
+
+    config = parse_xfer_debug_config(str(config_path))
+
+    assert config is not None
+    assert config.dump_dir.name == "h20_golden"
+    assert config.max_requests == 2
+    assert config.dump_on_prefill is True
+
+
+def test_xfer_debug_dump_records_source_slice_and_full_block(tmp_path: Path):
+    tensor = torch.arange(64, dtype=torch.uint8).reshape(4, 16)
+    descriptor = XferDebugDescriptor(
+        transfer_id="transfer-1",
+        d_req_id="d-req-1",
+        tp_rank=0,
+        descriptor_idx=0,
+        region_idx=2,
+        block_id=1,
+        local_block_id=1,
+        remote_block_id=7,
+        local_block_ids=(1,),
+        remote_block_ids=(7,),
+        block_ordinals=(0,),
+        src_ptr=tensor.data_ptr() + 16 + 4,
+        dst_ptr=0,
+        length=8,
+        src_offset=4,
+        dst_offset=0,
+        source_layer="model.layers.3.attn",
+        target_layers=("model.layers.3.attn",),
+        source_block_len=16,
+        target_block_len=8,
+        bucket_type="c128_1728",
+    )
+
+    dumped = dump_xfer_debug_records(
+        XferDebugDumpRequest(
+            config=XferDebugConfig(
+                dump_dir=tmp_path,
+                max_requests=1,
+                dump_full_source_block=True,
+            ),
+            cache_views=(
+                XferDebugCacheView(
+                    layer_name="model.layers.3.attn",
+                    tensor=tensor,
+                    base_addr=tensor.data_ptr(),
+                    block_len=16,
+                ),
+            ),
+            side="producer",
+            pointer_kind="source",
+            descriptors=(descriptor,),
+        )
+    )
+
+    records = load_records(tmp_path)
+    assert dumped == 1
+    assert len(records) == 1
+    assert records[0]["payload"].tolist() == list(range(20, 28))
+    assert records[0]["full_source_block"].tolist() == list(range(16, 32))
+    assert records[0]["descriptor"]["bucket_type"] == "c128_1728"
+    assert descriptor_from_dict(descriptor_to_dict(descriptor)) == descriptor
+
+
+def test_native_prefill_descriptors_follow_kv_cache_tensor_order():
+    cache_a = torch.arange(64, dtype=torch.uint8).reshape(4, 16)
+    cache_b = torch.arange(128, dtype=torch.uint8).reshape(4, 32)
+    kv_cache_config = _FakeKVCacheConfig(
+        kv_cache_tensors=(
+            _FakeKVCacheTensor(shared_by=("layer.a", "layer.b")),
+            _FakeKVCacheTensor(shared_by=("layer.c",)),
+        ),
+        kv_cache_groups=(
+            _FakeKVCacheGroup(layer_names=("layer.a",)),
+            _FakeKVCacheGroup(layer_names=("layer.b",)),
+            _FakeKVCacheGroup(layer_names=("layer.c",)),
+        ),
+    )
+
+    group_block_ids = ((3, 1), (2,), (0,))
+    descriptors = build_native_kv_cache_descriptors(
+        NativeKVCacheDescriptorRequest(
+            kv_cache_config=kv_cache_config,
+            kv_caches={"layer.a": cache_a, "layer.b": cache_a, "layer.c": cache_b},
+            request_id="req-1",
+            transfer_id="native-prefill",
+            tp_rank=0,
+            group_block_ids=group_block_ids,
+        )
+    )
+
+    assert group_block_ids == ((3, 1), (2,), (0,))
+    assert [(d.region_idx, d.block_id, d.length) for d in descriptors] == [
+        (0, 3, 16),
+        (0, 1, 16),
+        (0, 2, 16),
+        (1, 0, 32),
+    ]
+    assert descriptors[1].block_ordinals == (1,)
+    assert descriptors[2].source_layer == "layer.b"
+    assert descriptors[2].block_ordinals == (2,)
+    assert descriptors[3].target_layers == ("layer.c",)
+    assert [
+        (view.layer_name, view.base_addr, view.block_len)
+        for view in build_xfer_debug_cache_views({"layer.a": cache_a})
+    ] == [("layer.a", cache_a.data_ptr(), 16)]
+
+
+def test_compare_xfer_debug_detects_byte_and_golden_mismatch(tmp_path: Path):
+    prefill_dir = tmp_path / "prefill"
+    decode_dir = tmp_path / "decode"
+    golden_dir = tmp_path / "golden"
+    prefill_dir.mkdir()
+    decode_dir.mkdir()
+    golden_dir.mkdir()
+
+    descriptor = _descriptor()
+    _save_record(prefill_dir / "p.pt", "producer", descriptor, b"\x01\x02\x03\x04")
+    _save_record(decode_dir / "d.pt", "consumer", descriptor, b"\x01\x02\x00\x04")
+    _save_record(golden_dir / "g.pt", "golden", descriptor, b"\x01\x02\x03\x04")
+
+    byte_results = compare_prefill_decode(
+        load_records(prefill_dir), load_records(decode_dir)
+    )
+    golden_results = compare_decode_golden(
+        load_records(decode_dir), load_records(golden_dir)
+    )
+
+    assert len(byte_results) == 1
+    assert byte_results[0].equal is False
+    assert byte_results[0].first_diff == 2
+    assert len(golden_results) == 1
+    assert golden_results[0].length_match is True
+    assert golden_results[0].max_abs is not None
+    assert golden_results[0].max_abs > 0
+
+
+def _descriptor() -> dict[str, object]:
+    return descriptor_to_dict(
+        XferDebugDescriptor(
+            transfer_id="transfer-1",
+            d_req_id="d-req-1",
+            tp_rank=0,
+            descriptor_idx=0,
+            region_idx=1,
+            block_id=3,
+            local_block_id=3,
+            remote_block_id=3,
+            local_block_ids=(3,),
+            remote_block_ids=(3,),
+            block_ordinals=(0,),
+            src_ptr=0,
+            dst_ptr=0,
+            length=4,
+            src_offset=0,
+            dst_offset=0,
+            source_layer="model.layers.2.attn",
+            target_layers=("model.layers.2.attn",),
+            source_block_len=4,
+            target_block_len=4,
+            bucket_type="37440",
+        )
+    )
+
+
+class _FakeKVCacheTensor(NamedTuple):
+    shared_by: tuple[str, ...]
+
+
+class _FakeKVCacheGroup(NamedTuple):
+    layer_names: tuple[str, ...]
+
+
+class _FakeKVCacheConfig(NamedTuple):
+    kv_cache_tensors: tuple[_FakeKVCacheTensor, ...]
+    kv_cache_groups: tuple[_FakeKVCacheGroup, ...]
+
+
+def _save_record(
+    path: Path,
+    side: str,
+    descriptor: dict[str, object],
+    payload: bytes,
+) -> None:
+    payload_tensor = torch.tensor(list(payload), dtype=torch.uint8)
+    torch.save(
+        {
+            "kind": "mooncake_xfer_debug",
+            "side": side,
+            "pointer_kind": "source" if side != "consumer" else "destination",
+            "descriptor": descriptor,
+            "tensor_dtype": "torch.float16",
+            "payload": payload_tensor,
+            "payload_num_bytes": len(payload),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+        path,
+    )

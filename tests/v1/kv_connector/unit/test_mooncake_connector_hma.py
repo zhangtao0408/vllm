@@ -7,6 +7,7 @@ send trimming, and group-count invariant checking in _build_transfer_params.
 """
 
 import asyncio
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeXferMetadata,
     SendBlockMeta,
     TransferRegion,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.xfer_debug import (
+    XferDebugConfig,
 )
 
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
@@ -214,7 +218,7 @@ def test_metadata_hma_block_ids():
     ".mooncake_connector.TransferEngine",
     FakeMooncakeWrapper,
 )
-async def test_build_transfer_params_multi_group_trimming(monkeypatch):
+async def test_build_transfer_params_multi_group_trimming(monkeypatch, tmp_path: Path):
     """_build_transfer_params trims per-group blocks when local > remote."""
 
     monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
@@ -277,6 +281,7 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
             lengths,
             err_reqs,
             err_msg,
+            debug_descriptors,
         ) = await worker._build_transfer_params(
             ready_reqs, xfer_meta, local_regions, remote_regions
         )
@@ -289,6 +294,31 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
         assert len(src_ptrs) > 0
         assert len(dst_ptrs) == len(src_ptrs)
         assert len(lengths) == len(src_ptrs)
+        assert debug_descriptors == []
+
+        worker.xfer_debug_config = XferDebugConfig(dump_dir=tmp_path)
+        (
+            debug_src_ptrs,
+            debug_dst_ptrs,
+            debug_lengths,
+            debug_err_reqs,
+            debug_err_msg,
+            debug_descriptors,
+        ) = await worker._build_transfer_params(
+            ready_reqs, xfer_meta, local_regions, remote_regions
+        )
+
+        assert debug_err_reqs == []
+        assert debug_err_msg is None
+        assert debug_src_ptrs == src_ptrs
+        assert debug_dst_ptrs == dst_ptrs
+        assert debug_lengths == lengths
+        assert len(debug_descriptors) == len(src_ptrs)
+        assert debug_descriptors[0].transfer_id == transfer_id
+        assert debug_descriptors[0].d_req_id == "d-trim"
+        assert debug_descriptors[0].region_idx == 0
+        assert debug_descriptors[0].source_block_len == block_len
+        assert debug_descriptors[0].target_block_len == block_len
 
         worker.shutdown()
 
@@ -360,6 +390,7 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
             lengths,
             err_reqs,
             err_msg,
+            debug_descriptors,
         ) = await worker._build_transfer_params(
             ready_reqs, xfer_meta, local_regions, remote_regions
         )
@@ -370,6 +401,7 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
         assert src_ptrs == []
         assert dst_ptrs == []
         assert lengths == []
+        assert debug_descriptors == []
 
         worker.shutdown()
 

@@ -41,6 +41,15 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.xfer_debug import (
+    XferDebugCacheView,
+    XferDebugConfig,
+    XferDebugDescriptor,
+    XferDebugDumpRequest,
+    XferDebugReadError,
+    dump_xfer_debug_records,
+    parse_xfer_debug_config,
+)
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -204,6 +213,12 @@ from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunne
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
+from vllm.v1.worker.kv_xfer_debug import (
+    NativeKVCacheDescriptorRequest,
+    build_native_kv_cache_descriptors,
+    build_xfer_debug_cache_views,
+    collect_group_block_ids,
+)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -523,6 +538,10 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_xfer_debug_config = self._init_kv_xfer_debug_config()
+        self._kv_xfer_debug_kv_caches: dict[str, torch.Tensor] = {}
+        self._kv_xfer_debug_cache_views: tuple[XferDebugCacheView, ...] = ()
+        self._kv_xfer_debug_dumped_req_ids: set[str] = set()
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -903,6 +922,96 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+
+    @staticmethod
+    def _init_kv_xfer_debug_config() -> XferDebugConfig | None:
+        if envs.VLLM_KV_XFER_DEBUG_CONFIG is None:
+            return None
+        return parse_xfer_debug_config(envs.VLLM_KV_XFER_DEBUG_CONFIG)
+
+    def _kv_xfer_debug_request_enabled(self, req_id: str) -> bool:
+        config = self.kv_xfer_debug_config
+        if config is None or config.max_requests == 0:
+            return False
+        if req_id in self._kv_xfer_debug_dumped_req_ids:
+            return True
+        if len(self._kv_xfer_debug_dumped_req_ids) >= config.max_requests:
+            return False
+        self._kv_xfer_debug_dumped_req_ids.add(req_id)
+        return True
+
+    def _dump_prefill_kv_xfer_debug(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        config = self.kv_xfer_debug_config
+        if config is None or not config.dump_on_prefill:
+            return
+        if (
+            self.kv_cache_config is None
+            or not self._kv_xfer_debug_kv_caches
+            or not self._kv_xfer_debug_cache_views
+        ):
+            return
+
+        descriptors: list[XferDebugDescriptor] = []
+        for req_id in self.input_batch.req_ids[: self.input_batch.num_reqs]:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if num_scheduled_tokens <= 0:
+                continue
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            num_computed_tokens = int(
+                self.input_batch.num_computed_tokens_cpu[req_index]
+            )
+            num_prompt_tokens = int(self.input_batch.num_prompt_tokens[req_index])
+            if num_computed_tokens >= num_prompt_tokens:
+                continue
+            if not self._kv_xfer_debug_request_enabled(req_id):
+                continue
+
+            group_block_ids = collect_group_block_ids(
+                self.input_batch.block_table,
+                req_index,
+            )
+            descriptors.extend(
+                build_native_kv_cache_descriptors(
+                    NativeKVCacheDescriptorRequest(
+                        kv_cache_config=self.kv_cache_config,
+                        kv_caches=self._kv_xfer_debug_kv_caches,
+                        request_id=req_id,
+                        transfer_id=(
+                            f"native_prefill:{req_id}:"
+                            f"{num_computed_tokens}:"
+                            f"{num_computed_tokens + num_scheduled_tokens}"
+                        ),
+                        tp_rank=get_tp_group().rank_in_group,
+                        group_block_ids=group_block_ids,
+                    )
+                )
+            )
+
+        if not descriptors:
+            return
+        try:
+            dumped = dump_xfer_debug_records(
+                XferDebugDumpRequest(
+                    config=config,
+                    cache_views=self._kv_xfer_debug_cache_views,
+                    side="golden",
+                    pointer_kind="source",
+                    descriptors=tuple(descriptors),
+                )
+            )
+        except (OSError, RuntimeError, XferDebugReadError, ValueError) as exc:
+            logger.warning("KV xfer prefill debug dump failed: %s", exc)
+            return
+        logger.info(
+            "KV xfer prefill debug dumped %d descriptor record(s) to %s.",
+            dumped,
+            config.dump_dir,
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -4286,6 +4395,8 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        self._dump_prefill_kv_xfer_debug(scheduler_output)
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -7318,6 +7429,12 @@ class GPUModelRunner(
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
+        )
+        self._kv_xfer_debug_kv_caches = kv_caches
+        self._kv_xfer_debug_cache_views = (
+            build_xfer_debug_cache_views(kv_caches)
+            if self.kv_xfer_debug_config is not None
+            else ()
         )
 
         if (
