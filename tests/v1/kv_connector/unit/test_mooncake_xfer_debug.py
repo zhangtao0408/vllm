@@ -485,6 +485,39 @@ def test_compare_xfer_debug_expands_descriptor_target_layers_without_record_alia
     assert golden_results[1].max_abs > 0
 
 
+def test_compare_xfer_debug_keeps_golden_tensor_name_physical(tmp_path: Path):
+    decode_dir = tmp_path / "decode"
+    golden_dir = tmp_path / "golden"
+    decode_dir.mkdir()
+    golden_dir.mkdir()
+
+    descriptor = _descriptor()
+    descriptor["target_layers"] = ("layer.k_cache", "layer.state_cache")
+    _save_record(
+        decode_dir / "d.pt",
+        "consumer",
+        descriptor,
+        b"\x01\x02\x03\x04",
+    )
+    _save_record(
+        golden_dir / "g.pt",
+        "golden",
+        descriptor,
+        b"\x01\x02\x00\x04",
+        tensor_name="layer.state_cache",
+    )
+
+    golden_results = compare_decode_golden(
+        load_records(decode_dir), load_records(golden_dir)
+    )
+
+    assert [result.key for result in golden_results] == [
+        (0, "layer.state_cache", 0),
+    ]
+    assert golden_results[0].max_abs is not None
+    assert golden_results[0].max_abs > 0
+
+
 def _descriptor() -> dict[str, object]:
     return descriptor_to_dict(
         XferDebugDescriptor(
@@ -533,6 +566,7 @@ def _save_record(
     payload: bytes,
     materialized_block_bytes: int | None = None,
     logical_tensor_names: tuple[str, ...] | None = None,
+    tensor_name: str | None = None,
 ) -> None:
     payload_tensor = torch.tensor(list(payload), dtype=torch.uint8)
     record = {
@@ -549,6 +583,8 @@ def _save_record(
         record["materialized_block_bytes"] = materialized_block_bytes
     if logical_tensor_names is not None:
         record["logical_tensor_names"] = logical_tensor_names
+    if tensor_name is not None:
+        record["tensor_name"] = tensor_name
     torch.save(
         record,
         path,

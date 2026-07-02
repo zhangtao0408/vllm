@@ -240,18 +240,27 @@ def _iter_block_records(
 
 
 def _logical_tensor_names(record: dict[str, Any]) -> tuple[str, ...]:
+    descriptor = record["descriptor"]
+    tensor_name = record.get("tensor_name")
+    if record.get("side") == "golden":
+        if isinstance(tensor_name, str):
+            return (tensor_name,)
+        source_layer = descriptor.get("source_layer")
+        if isinstance(source_layer, str):
+            return (source_layer,)
+
     names = record.get("logical_tensor_names")
     if isinstance(names, (list, tuple)) and all(
         isinstance(name, str) for name in names
     ):
         return tuple(names)
-    descriptor = record["descriptor"]
+
     target_layers = descriptor.get("target_layers")
     if isinstance(target_layers, (list, tuple)) and all(
         isinstance(name, str) for name in target_layers
     ):
         return tuple(target_layers)
-    tensor_name = record.get("tensor_name")
+
     if isinstance(tensor_name, str):
         return (tensor_name,)
     return (str(descriptor["region_idx"]),)
