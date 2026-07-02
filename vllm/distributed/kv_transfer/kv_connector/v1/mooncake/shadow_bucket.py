@@ -153,7 +153,7 @@ def build_shadow_bucket_plan(
             source = producer_slots.get(canonical_cache_name(target_layer_name))
             if source is None:
                 raise MissingSourceCacheError(target_layer_name)
-            source_candidates[(source.page_size, source.slot_idx)] = source
+            source_candidates.setdefault((source.page_size, source.slot_idx), source)
 
         source = next(iter(source_candidates.values()))
         placements.append(
