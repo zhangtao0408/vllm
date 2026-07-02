@@ -155,6 +155,7 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
             descriptor.length,
             preferred_names,
         )
+        logical_tensor_name = _logical_tensor_name(descriptor)
         record = _build_record(
             side=request.side,
             pointer_kind=request.pointer_kind,
@@ -162,7 +163,8 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
             payload=payload,
             tensor_dtype=str(payload_view.tensor.dtype),
             tensor_shape=tuple(payload_view.tensor.shape),
-            tensor_name=payload_view.layer_name,
+            tensor_name=logical_tensor_name,
+            physical_tensor_name=payload_view.layer_name,
             block_stride_bytes=payload_view.block_len,
             materialized_block_bytes=payload_view.readable_block_len,
             payload_padding_num_bytes=payload_padding_num_bytes,
@@ -176,7 +178,7 @@ def dump_xfer_debug_records(request: XferDebugDumpRequest) -> int:
                 request.side,
                 descriptor,
                 request.rank_tag,
-                payload_view.layer_name,
+                logical_tensor_name,
             ),
         )
         dumped += 1
@@ -339,6 +341,12 @@ def _preferred_tensor_names(
     return descriptor.target_layers
 
 
+def _logical_tensor_name(descriptor: XferDebugDescriptor) -> str:
+    if descriptor.target_layers:
+        return descriptor.target_layers[0]
+    return descriptor.source_layer
+
+
 def _build_record(
     side: str,
     pointer_kind: PointerKind,
@@ -347,6 +355,7 @@ def _build_record(
     tensor_dtype: str,
     tensor_shape: tuple[int, ...],
     tensor_name: str,
+    physical_tensor_name: str,
     block_stride_bytes: int,
     materialized_block_bytes: int,
     payload_padding_num_bytes: int,
@@ -362,6 +371,8 @@ def _build_record(
         "tensor_dtype": tensor_dtype,
         "tensor_shape": tensor_shape,
         "tensor_name": tensor_name,
+        "physical_tensor_name": physical_tensor_name,
+        "logical_tensor_names": tuple(descriptor.target_layers),
         "block_stride_bytes": block_stride_bytes,
         "materialized_block_bytes": materialized_block_bytes,
         "rank_tag": rank_tag,

@@ -24,7 +24,7 @@ class ByteComparison:
 
 @dataclass(frozen=True)
 class GoldenComparison:
-    key: tuple[int, int, int]
+    key: tuple[int, str, int]
     bucket_type: str
     length_match: bool
     compared_bytes: int
@@ -153,33 +153,44 @@ def _descriptor_key(record: dict[str, Any]) -> tuple[str, str, int, int]:
 
 def _iter_block_records(
     record: dict[str, Any],
-) -> Iterable[tuple[tuple[int, int, int], bytes]]:
+) -> Iterable[tuple[tuple[int, str, int], bytes]]:
     descriptor = record["descriptor"]
     payload = _payload_bytes(record)
     block_ordinals = [int(item) for item in descriptor["block_ordinals"]]
     if not block_ordinals:
         return
+    tensor_names = _logical_tensor_names(record)
     materialized_block_bytes = _materialized_block_bytes(record)
     if len(block_ordinals) <= 1:
-        yield (
-            (
-                int(descriptor["tp_rank"]),
-                int(descriptor["region_idx"]),
-                block_ordinals[0],
-            ),
-            _trim_padding(payload, materialized_block_bytes),
-        )
+        chunk = _trim_padding(payload, materialized_block_bytes)
+        for tensor_name in tensor_names:
+            yield (
+                (int(descriptor["tp_rank"]), tensor_name, block_ordinals[0]),
+                chunk,
+            )
         return
     chunk_len = len(payload) // len(block_ordinals)
     for offset, block_ordinal in enumerate(block_ordinals):
         start = offset * chunk_len
-        yield (
-            (int(descriptor["tp_rank"]), int(descriptor["region_idx"]), block_ordinal),
-            _trim_padding(
-                payload[start : start + chunk_len],
-                materialized_block_bytes,
-            ),
+        chunk = _trim_padding(
+            payload[start : start + chunk_len],
+            materialized_block_bytes,
         )
+        for tensor_name in tensor_names:
+            yield ((int(descriptor["tp_rank"]), tensor_name, block_ordinal), chunk)
+
+
+def _logical_tensor_names(record: dict[str, Any]) -> tuple[str, ...]:
+    names = record.get("logical_tensor_names")
+    if isinstance(names, (list, tuple)) and all(
+        isinstance(name, str) for name in names
+    ):
+        return tuple(names)
+    tensor_name = record.get("tensor_name")
+    if isinstance(tensor_name, str):
+        return (tensor_name,)
+    descriptor = record["descriptor"]
+    return (str(descriptor["region_idx"]),)
 
 
 def _payload_bytes(record: dict[str, Any]) -> bytes:

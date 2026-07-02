@@ -297,8 +297,10 @@ def test_xfer_debug_prefers_descriptor_layer_name_for_shared_tensor(
 
     records = load_records(tmp_path)
     assert len(records) == 1
-    assert records[0]["tensor_name"] == "layer.b"
-    assert "tensor_layer.b" in Path(records[0]["path"]).name
+    assert records[0]["tensor_name"] == "layer.a"
+    assert records[0]["physical_tensor_name"] == "layer.b"
+    assert records[0]["logical_tensor_names"] == ("layer.a", "layer.b")
+    assert "tensor_layer.a" in Path(records[0]["path"]).name
 
 
 def test_compare_xfer_debug_detects_byte_and_golden_mismatch(tmp_path: Path):
@@ -363,6 +365,49 @@ def test_compare_xfer_debug_ignores_padding_for_golden_stats(tmp_path: Path):
     assert golden_results[0].allclose is True
 
 
+def test_compare_xfer_debug_expands_decode_logical_aliases(tmp_path: Path):
+    decode_dir = tmp_path / "decode"
+    golden_dir = tmp_path / "golden"
+    decode_dir.mkdir()
+    golden_dir.mkdir()
+
+    descriptor = _descriptor()
+    descriptor["target_layers"] = ("layer.primary", "layer.alias0", "layer.alias1")
+    _save_record(
+        decode_dir / "d.pt",
+        "consumer",
+        descriptor,
+        b"\x01\x02\x03\x04",
+        logical_tensor_names=("layer.primary", "layer.alias0", "layer.alias1"),
+    )
+    _save_record(
+        golden_dir / "g0.pt",
+        "golden",
+        {**descriptor, "target_layers": ("layer.alias0",)},
+        b"\x01\x02\x03\x04",
+        logical_tensor_names=("layer.alias0",),
+    )
+    _save_record(
+        golden_dir / "g1.pt",
+        "golden",
+        {**descriptor, "target_layers": ("layer.alias1",)},
+        b"\x01\x02\x00\x04",
+        logical_tensor_names=("layer.alias1",),
+    )
+
+    golden_results = compare_decode_golden(
+        load_records(decode_dir), load_records(golden_dir)
+    )
+
+    assert [result.key for result in golden_results] == [
+        (0, "layer.alias0", 0),
+        (0, "layer.alias1", 0),
+    ]
+    assert golden_results[0].allclose is True
+    assert golden_results[1].max_abs is not None
+    assert golden_results[1].max_abs > 0
+
+
 def _descriptor() -> dict[str, object]:
     return descriptor_to_dict(
         XferDebugDescriptor(
@@ -410,6 +455,7 @@ def _save_record(
     descriptor: dict[str, object],
     payload: bytes,
     materialized_block_bytes: int | None = None,
+    logical_tensor_names: tuple[str, ...] | None = None,
 ) -> None:
     payload_tensor = torch.tensor(list(payload), dtype=torch.uint8)
     record = {
@@ -424,6 +470,8 @@ def _save_record(
     }
     if materialized_block_bytes is not None:
         record["materialized_block_bytes"] = materialized_block_bytes
+    if logical_tensor_names is not None:
+        record["logical_tensor_names"] = logical_tensor_names
     torch.save(
         record,
         path,
