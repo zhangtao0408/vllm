@@ -741,21 +741,13 @@ class MooncakeConnectorScheduler:
         if block_size <= 0:
             block_size = self.block_size
 
-        compress_ratios = [
-            max(1, int(compress_ratio))
-            for spec in specs
-            if (compress_ratio := getattr(spec, "compress_ratio", 1)) is not None
-        ]
-        compressed_ratios = [ratio for ratio in compress_ratios if ratio > 1]
-        group_min_compress_ratio = min(compressed_ratios) if compressed_ratios else 1
-
         sliding_window = 0
         for spec in specs:
             if isinstance(spec, SlidingWindowSpec):
                 sliding_window = max(sliding_window, spec.sliding_window)
 
         return GroupTransferInfo(
-            tokens_per_block=block_size * group_min_compress_ratio,
+            tokens_per_block=block_size,
             blocks_per_window=cdiv(sliding_window, block_size) + 1
             if sliding_window
             else 0,

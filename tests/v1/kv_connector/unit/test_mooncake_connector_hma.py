@@ -232,8 +232,8 @@ def test_clip_blocks_to_external_tokens_uses_mla_semantic_block_size():
         ([17, 14],), num_external_tokens=block_size + 1
     )
 
-    assert scheduler.group_transfer_info[0].tokens_per_block == block_size * 4
-    assert clipped == [[17]]
+    assert scheduler.group_transfer_info[0].tokens_per_block == block_size
+    assert clipped == [[17, 14]]
 
 
 @pytest.mark.cpu_test
