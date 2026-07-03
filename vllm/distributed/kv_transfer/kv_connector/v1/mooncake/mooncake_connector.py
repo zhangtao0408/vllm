@@ -819,7 +819,8 @@ class MooncakeConnectorScheduler:
             token_ids = request.prompt_token_ids or []
             external_token_count = self._state_prefill_token_count(len(token_ids))
             count = max(external_token_count - num_computed_tokens, 0)
-            return count, True
+            if count > 0:
+                return count, True
 
         # No remote prefill for this request.
         return 0, False
@@ -2820,7 +2821,10 @@ class MooncakeConnectorWorker:
             pull_meta = pull_metas[req_id]
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
-            if pull_meta.pull_tasks_count == 0:
+            if (
+                pull_meta.pull_tasks_count == 0
+                and any(pull_meta.local_block_ids)
+            ):
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
 
         if ok_reqs:

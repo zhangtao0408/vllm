@@ -19,7 +19,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeConnector,
     MooncakeConnectorMetadata,
     MooncakeConnectorScheduler,
+    MooncakeConnectorWorker,
     MooncakeXferMetadata,
+    MooncakeXferResponse,
+    MooncakeXferResponseStatus,
+    PullReqMeta,
     SendBlockMeta,
     TransferRegion,
 )
@@ -285,7 +289,7 @@ def test_get_num_new_matched_tokens_rounds_compressed_prefill_to_window():
 
 
 @pytest.mark.cpu_test
-def test_get_num_new_matched_tokens_waits_for_empty_remote_prefill():
+def test_get_num_new_matched_tokens_skips_empty_remote_prefill_load():
     block_size = 16
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector",
@@ -307,7 +311,57 @@ def test_get_num_new_matched_tokens_waits_for_empty_remote_prefill():
     )
 
     assert count == 0
-    assert async_load is True
+    assert async_load is False
+
+
+@pytest.mark.cpu_test
+def test_process_pulling_result_skips_finished_recving_for_empty_pull():
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker.xfer_debug_config = None
+    worker.finished_recving_reqs = set()
+
+    pull_meta = PullReqMeta(
+        d_req_id="d-req",
+        transfer_id="transfer",
+        local_block_ids=[],
+        remote_engine_id="engine",
+        remote_bootstrap_addr="addr",
+        pull_tasks_count=1,
+    )
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        ok_reqs=["d-req"],
+    )
+
+    worker.process_pulling_result(response, {"d-req": pull_meta})
+
+    assert pull_meta.pull_tasks_count == 0
+    assert worker.finished_recving_reqs == set()
+
+
+@pytest.mark.cpu_test
+def test_process_pulling_result_marks_finished_recving_for_non_empty_pull():
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker.xfer_debug_config = None
+    worker.finished_recving_reqs = set()
+
+    pull_meta = PullReqMeta(
+        d_req_id="d-req",
+        transfer_id="transfer",
+        local_block_ids=[[1]],
+        remote_engine_id="engine",
+        remote_bootstrap_addr="addr",
+        pull_tasks_count=1,
+    )
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        ok_reqs=["d-req"],
+    )
+
+    worker.process_pulling_result(response, {"d-req": pull_meta})
+
+    assert pull_meta.pull_tasks_count == 0
+    assert worker.finished_recving_reqs == {"d-req"}
 
 
 @pytest.mark.cpu_test
