@@ -780,15 +780,21 @@ class MooncakeConnectorScheduler:
         ):
             return
 
+        prefill_tokens = max(
+            self._state_prefill_token_count(request.num_prompt_tokens), 1
+        )
+        if prefill_tokens >= request.num_prompt_tokens:
+            return
+
         if request.prompt_token_ids is not None:
-            request.prompt_token_ids.pop()
+            del request.prompt_token_ids[prefill_tokens:]
         elif request.prompt_embeds is not None:
-            request.prompt_embeds = request.prompt_embeds[:-1]
+            request.prompt_embeds = request.prompt_embeds[:prefill_tokens]
         else:
             return
 
-        request._all_token_ids.pop()
-        request.num_prompt_tokens -= 1
+        del request._all_token_ids[prefill_tokens:]
+        request.num_prompt_tokens = prefill_tokens
         request.max_tokens = 1
         params["_p_side_truncated"] = True
 
