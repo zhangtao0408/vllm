@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -24,6 +25,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.xfer_debug import (
     XferDebugConfig,
+)
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
 )
 
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
@@ -184,6 +190,46 @@ def test_clip_blocks_to_external_tokens_drops_extra_tail_blocks():
     )
 
     assert clipped == [[1, 2], [10, 11]]
+
+
+@pytest.mark.cpu_test
+def test_clip_blocks_to_external_tokens_uses_mla_compress_ratio():
+    block_size = 64
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.2.attn.indexer.k_cache"],
+                MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                    compress_ratio=4,
+                    alignment=576,
+                ),
+            )
+        ],
+    )
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+
+    clipped = scheduler._clip_blocks_to_external_tokens(
+        ([17, 14],), num_external_tokens=block_size + 1
+    )
+
+    assert scheduler.group_transfer_info[0].tokens_per_block == block_size * 4
+    assert clipped == [[17]]
 
 
 # ---------------------------------------------------------------------------

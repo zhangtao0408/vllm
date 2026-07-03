@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -10,7 +11,6 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
-import os
 import httpx
 import msgspec
 import numpy as np
@@ -105,6 +105,12 @@ class TransferRegion:
     base_addr: int
     block_len: int
     kv_block_len: int
+
+
+@dataclass(frozen=True)
+class GroupTransferInfo:
+    tokens_per_block: int
+    blocks_per_window: int
 
 
 @dataclass(frozen=True)
@@ -673,18 +679,12 @@ class MooncakeConnectorScheduler:
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
 
-        # Compute sliding window block counts per KV cache group.
-        sw_sizes_tokens: list[tuple[int, int]] = [
-            (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
-            if isinstance(g.kv_cache_spec, SlidingWindowSpec)
-            else (0, self.block_size)
-            for g in kv_cache_config.kv_cache_groups
+        self.group_transfer_info = [
+            self._get_group_transfer_info(group)
+            for group in kv_cache_config.kv_cache_groups
         ]
-        # cdiv(n_tokens, block_size) gives blocks/window; add 1 to
-        # conservatively account for boundary overlap.
         self.blocks_per_sw = [
-            cdiv(n_tokens, block_size) + 1 if n_tokens else 0
-            for n_tokens, block_size in sw_sizes_tokens
+            group_info.blocks_per_window for group_info in self.group_transfer_info
         ]
 
     def get_sw_clipped_blocks(
@@ -699,7 +699,54 @@ class MooncakeConnectorScheduler:
             for i, blocks in enumerate(block_ids)
         ]
 
+    @staticmethod
+    def _get_group_unique_specs(group: Any) -> list[Any]:
+        group_spec = group.kv_cache_spec
+        inner_specs = getattr(group_spec, "kv_cache_specs", None)
+        if not isinstance(inner_specs, dict):
+            return [group_spec]
+
+        specs = []
+        for layer_name in group.layer_names:
+            layer_spec = inner_specs.get(layer_name)
+            if layer_spec is not None and layer_spec not in specs:
+                specs.append(layer_spec)
+        return specs or [group_spec]
+
+    def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
+        specs = self._get_group_unique_specs(group)
+        first_spec = specs[0] if specs else group.kv_cache_spec
+        block_size = getattr(
+            group.kv_cache_spec,
+            "block_size",
+            getattr(first_spec, "block_size", self.block_size),
+        )
+        if block_size <= 0:
+            block_size = self.block_size
+
+        compress_ratios = [
+            max(1, int(compress_ratio))
+            for spec in specs
+            if (compress_ratio := getattr(spec, "compress_ratio", 1)) is not None
+        ]
+        compressed_ratios = [ratio for ratio in compress_ratios if ratio > 1]
+        group_min_compress_ratio = min(compressed_ratios) if compressed_ratios else 1
+
+        sliding_window = 0
+        for spec in specs:
+            if isinstance(spec, SlidingWindowSpec):
+                sliding_window = max(sliding_window, spec.sliding_window)
+
+        return GroupTransferInfo(
+            tokens_per_block=block_size * group_min_compress_ratio,
+            blocks_per_window=cdiv(sliding_window, block_size) + 1
+            if sliding_window
+            else 0,
+        )
+
     def _get_group_transfer_block_size(self, group_idx: int) -> int:
+        if group_idx < len(self.group_transfer_info):
+            return self.group_transfer_info[group_idx].tokens_per_block
         if group_idx >= len(self.kv_cache_config.kv_cache_groups):
             return self.block_size
         spec = self.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
@@ -796,12 +843,17 @@ class MooncakeConnectorScheduler:
                 logger.debug(
                     "MooncakeConnector recv blocks: req_id=%s "
                     "num_external_tokens=%s raw_group_lens=%s "
-                    "external_group_lens=%s clipped_group_lens=%s",
+                    "external_group_lens=%s clipped_group_lens=%s "
+                    "tokens_per_block=%s",
                     request.request_id,
                     num_external_tokens,
                     [len(group) for group in unhashed_block_ids],
                     [len(group) for group in external_block_ids],
                     [len(group) for group in local_block_ids],
+                    [
+                        group_info.tokens_per_block
+                        for group_info in self.group_transfer_info
+                    ],
                 )
                 # Get unhashed blocks to pull from remote.
                 self._reqs_need_recv[request.request_id] = (request, local_block_ids)
