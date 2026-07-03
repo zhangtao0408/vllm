@@ -285,7 +285,7 @@ def test_get_num_new_matched_tokens_rounds_compressed_prefill_to_window():
 
 
 @pytest.mark.cpu_test
-def test_get_num_new_matched_tokens_waits_for_all_compressed_buckets():
+def test_get_num_new_matched_tokens_waits_for_empty_remote_prefill():
     block_size = 16
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector",
@@ -307,7 +307,7 @@ def test_get_num_new_matched_tokens_waits_for_all_compressed_buckets():
     )
 
     assert count == 0
-    assert async_load is False
+    assert async_load is True
 
 
 @pytest.mark.cpu_test

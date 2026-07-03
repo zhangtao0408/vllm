@@ -819,8 +819,7 @@ class MooncakeConnectorScheduler:
             token_ids = request.prompt_token_ids or []
             external_token_count = self._state_prefill_token_count(len(token_ids))
             count = max(external_token_count - num_computed_tokens, 0)
-            if count > 0:
-                return count, True
+            return count, True
 
         # No remote prefill for this request.
         return 0, False
