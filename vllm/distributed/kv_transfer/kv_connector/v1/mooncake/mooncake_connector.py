@@ -644,6 +644,7 @@ class MooncakeConnectorScheduler:
     ):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
+        self.kv_cache_config = kv_cache_config
 
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
@@ -696,6 +697,27 @@ class MooncakeConnectorScheduler:
             blocks[-self.blocks_per_sw[i] :] if self.blocks_per_sw[i] > 0 else blocks
             for i, blocks in enumerate(block_ids)
         ]
+
+    def _get_group_transfer_block_size(self, group_idx: int) -> int:
+        if group_idx >= len(self.kv_cache_config.kv_cache_groups):
+            return self.block_size
+        spec = self.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
+        group_block_size = getattr(spec, "block_size", self.block_size)
+        return group_block_size if group_block_size > 0 else self.block_size
+
+    def _clip_blocks_to_external_tokens(
+        self,
+        block_ids: tuple[list[int], ...] | list[list[int]],
+        num_external_tokens: int,
+    ) -> list[list[int]]:
+        if len(block_ids) == 0 or num_external_tokens <= 0:
+            return [[] for _ in range(len(block_ids))]
+        clipped_blocks: list[list[int]] = []
+        for group_idx, blocks in enumerate(block_ids):
+            group_block_size = self._get_group_transfer_block_size(group_idx)
+            num_external_blocks = cdiv(num_external_tokens, group_block_size)
+            clipped_blocks.append(list(blocks[:num_external_blocks]))
+        return clipped_blocks
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -766,7 +788,20 @@ class MooncakeConnectorScheduler:
                     if num_external_tokens > 0
                     else ()
                 )
-                local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
+                external_block_ids = self._clip_blocks_to_external_tokens(
+                    unhashed_block_ids, num_external_tokens
+                )
+                local_block_ids = self.get_sw_clipped_blocks(external_block_ids)
+                logger.debug(
+                    "MooncakeConnector recv blocks: req_id=%s "
+                    "num_external_tokens=%s raw_group_lens=%s "
+                    "external_group_lens=%s clipped_group_lens=%s",
+                    request.request_id,
+                    num_external_tokens,
+                    [len(group) for group in unhashed_block_ids],
+                    [len(group) for group in external_block_ids],
+                    [len(group) for group in local_block_ids],
+                )
                 # Get unhashed blocks to pull from remote.
                 self._reqs_need_recv[request.request_id] = (request, local_block_ids)
             else:
@@ -1586,9 +1621,19 @@ class MooncakeConnectorWorker:
         self,
         local_group: list[int],
         remote_group: list[int],
+        d_req_id: ReqId,
+        source_layer: str,
+        target_layer: str,
     ) -> tuple[list[int], list[int], str | None]:
         if len(local_group) < len(remote_group):
-            return [], [], "P num blocks less than D"
+            return (
+                [],
+                [],
+                "P num blocks less than D "
+                f"(req={d_req_id} source={source_layer} target={target_layer} "
+                f"local_len={len(local_group)} remote_len={len(remote_group)} "
+                f"local_tail={local_group[-4:]} remote_tail={remote_group[-4:]})",
+            )
         if len(local_group) > len(remote_group):
             local_group = local_group[-len(remote_group) :]
         return list(local_group), list(remote_group), None
@@ -1854,6 +1899,9 @@ class MooncakeConnectorWorker:
                     self._trim_shadow_group_blocks(
                         send_meta.local_block_ids[source.group_idx],
                         remote_block_ids_per_group[remote_group_idx],
+                        d_req_id,
+                        source.layer_name,
+                        layer_mapping.target_layer_name,
                     )
                 )
                 if block_error is not None:

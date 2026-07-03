@@ -161,6 +161,31 @@ def test_get_sw_clipped_blocks_noop_no_hma():
     assert clipped == [[1, 2, 3]]
 
 
+@pytest.mark.cpu_test
+def test_clip_blocks_to_external_tokens_drops_extra_tail_blocks():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    kv_cache_config = make_kv_cache_config(block_size=block_size, swa_enabled=True)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+
+    block_ids = ([1, 2, 3], [10, 11, 12])
+
+    clipped = scheduler._clip_blocks_to_external_tokens(
+        block_ids, num_external_tokens=block_size + 1
+    )
+
+    assert clipped == [[1, 2], [10, 11]]
+
+
 # ---------------------------------------------------------------------------
 #  test_metadata_hma_block_ids: MooncakeConnectorMetadata stores per-group IDs
 # ---------------------------------------------------------------------------
