@@ -683,7 +683,7 @@ class MooncakeConnectorScheduler:
             self._get_group_transfer_info(group)
             for group in kv_cache_config.kv_cache_groups
         ]
-        self.use_compress = self._model_uses_compress()
+        self.prefill_compress_ratio = self._get_prefill_compress_ratio()
         self.blocks_per_sw = [
             group_info.blocks_per_window for group_info in self.group_transfer_info
         ]
@@ -714,10 +714,21 @@ class MooncakeConnectorScheduler:
                 specs.append(layer_spec)
         return specs or [group_spec]
 
-    def _model_uses_compress(self) -> bool:
+    def _get_prefill_compress_ratio(self) -> int:
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
         compress_ratios = getattr(hf_config, "compress_ratios", None)
-        return isinstance(compress_ratios, (list, tuple, dict))
+        if isinstance(compress_ratios, dict):
+            ratio_values = compress_ratios.values()
+        elif isinstance(compress_ratios, (list, tuple)):
+            ratio_values = compress_ratios
+        else:
+            return 1
+        positive_ratios = [
+            int(ratio)
+            for ratio in ratio_values
+            if isinstance(ratio, int) and ratio > 1
+        ]
+        return min(positive_ratios, default=1)
 
     def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
         specs = self._get_group_unique_specs(group)
@@ -752,9 +763,12 @@ class MooncakeConnectorScheduler:
         return group_block_size if group_block_size > 0 else self.block_size
 
     def _state_prefill_token_count(self, num_prompt_tokens: int) -> int:
-        if self.use_compress and num_prompt_tokens > 1:
-            return num_prompt_tokens - 1
-        return num_prompt_tokens
+        if self.prefill_compress_ratio <= 1 or num_prompt_tokens <= 1:
+            return num_prompt_tokens
+        prefill_tokens = num_prompt_tokens - 1
+        return (
+            prefill_tokens // self.prefill_compress_ratio
+        ) * self.prefill_compress_ratio
 
     def _clip_blocks_to_external_tokens(
         self,
