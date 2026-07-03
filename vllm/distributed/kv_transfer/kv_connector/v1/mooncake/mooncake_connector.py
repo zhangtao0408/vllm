@@ -770,6 +770,28 @@ class MooncakeConnectorScheduler:
             prefill_tokens // self.prefill_compress_ratio
         ) * self.prefill_compress_ratio
 
+    def _truncate_request_for_prefill(self, request: "Request") -> None:
+        params = request.kv_transfer_params
+        if (
+            params is None
+            or params.get("_p_side_truncated")
+            or self.prefill_compress_ratio <= 1
+            or request.num_prompt_tokens <= 1
+        ):
+            return
+
+        if request.prompt_token_ids is not None:
+            request.prompt_token_ids.pop()
+        elif request.prompt_embeds is not None:
+            request.prompt_embeds = request.prompt_embeds[:-1]
+        else:
+            return
+
+        request._all_token_ids.pop()
+        request.num_prompt_tokens -= 1
+        request.max_tokens = 1
+        params["_p_side_truncated"] = True
+
     def _clip_blocks_to_external_tokens(
         self,
         block_ids: tuple[list[int], ...] | list[list[int]],
@@ -821,6 +843,9 @@ class MooncakeConnectorScheduler:
             count = max(external_token_count - num_computed_tokens, 0)
             if count > 0:
                 return count, True
+
+        if params.get("do_remote_decode"):
+            self._truncate_request_for_prefill(request)
 
         # No remote prefill for this request.
         return 0, False
