@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
+import os
 import httpx
 import msgspec
 import numpy as np
@@ -962,8 +963,11 @@ class MooncakeConnectorWorker:
         logger.info(
             "The Mooncake Transfer Engine is using %s as its protocol.", protocol
         )
+        
+        mlx_bond_list = os.getenv("MLX_BONDS", "mlx5_bond_4")
+
         ret_value = self.engine.initialize(
-            self.hostname, "P2PHANDSHAKE", protocol, "mlx5_bond_4"
+            self.hostname, "P2PHANDSHAKE", protocol, mlx_bond_list
         )
         if ret_value != 0:
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
