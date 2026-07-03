@@ -728,7 +728,7 @@ class MooncakeConnectorScheduler:
             for ratio in ratio_values
             if isinstance(ratio, int) and ratio > 1
         ]
-        return min(positive_ratios, default=1)
+        return max(positive_ratios, default=1)
 
     def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
         specs = self._get_group_unique_specs(group)

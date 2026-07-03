@@ -274,14 +274,40 @@ def test_get_num_new_matched_tokens_rounds_compressed_prefill_to_window():
         engine_id="test-engine",
         kv_cache_config=kv_cache_config,
     )
+    request = create_request(num_tokens=130, do_remote_prefill=True)
+
+    count, async_load = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert count == 128
+    assert async_load is True
+
+
+@pytest.mark.cpu_test
+def test_get_num_new_matched_tokens_waits_for_all_compressed_buckets():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    vllm_config.model_config.hf_config.compress_ratios = [0, 0, 4, 128]
+    kv_cache_config = make_kv_cache_config(block_size=block_size)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
     request = create_request(num_tokens=18, do_remote_prefill=True)
 
     count, async_load = scheduler.get_num_new_matched_tokens(
         request, num_computed_tokens=0
     )
 
-    assert count == 16
-    assert async_load is True
+    assert count == 0
+    assert async_load is False
 
 
 @pytest.mark.cpu_test
