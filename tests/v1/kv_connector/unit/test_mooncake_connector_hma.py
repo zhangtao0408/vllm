@@ -7,9 +7,11 @@ send trimming, and group-count invariant checking in _build_transfer_params.
 """
 
 import asyncio
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -17,9 +19,21 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeConnector,
     MooncakeConnectorMetadata,
     MooncakeConnectorScheduler,
+    MooncakeConnectorWorker,
     MooncakeXferMetadata,
+    MooncakeXferResponse,
+    MooncakeXferResponseStatus,
+    PullReqMeta,
     SendBlockMeta,
     TransferRegion,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.xfer_debug import (
+    XferDebugConfig,
+)
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
 )
 
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
@@ -157,6 +171,224 @@ def test_get_sw_clipped_blocks_noop_no_hma():
     assert clipped == [[1, 2, 3]]
 
 
+@pytest.mark.cpu_test
+def test_clip_blocks_to_external_tokens_drops_extra_tail_blocks():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    kv_cache_config = make_kv_cache_config(block_size=block_size, swa_enabled=True)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+
+    block_ids = ([1, 2, 3], [10, 11, 12])
+
+    clipped = scheduler._clip_blocks_to_external_tokens(
+        block_ids, num_external_tokens=block_size + 1
+    )
+
+    assert clipped == [[1, 2], [10, 11]]
+
+
+@pytest.mark.cpu_test
+def test_clip_blocks_to_external_tokens_uses_mla_semantic_block_size():
+    block_size = 64
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.2.attn.indexer.k_cache"],
+                MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                    compress_ratio=4,
+                    alignment=576,
+                ),
+            )
+        ],
+    )
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+
+    clipped = scheduler._clip_blocks_to_external_tokens(
+        ([17, 14],), num_external_tokens=block_size + 1
+    )
+
+    assert scheduler.group_transfer_info[0].tokens_per_block == block_size
+    assert clipped == [[17, 14]]
+
+
+@pytest.mark.cpu_test
+def test_get_num_new_matched_tokens_uses_compressed_prefill_state():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    vllm_config.model_config.hf_config.compress_ratios = [0, 0, 4]
+    kv_cache_config = make_kv_cache_config(block_size=block_size)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    request = create_request(num_tokens=17, do_remote_prefill=True)
+
+    count, async_load = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert count == 16
+    assert async_load is True
+
+
+@pytest.mark.cpu_test
+def test_get_num_new_matched_tokens_rounds_compressed_prefill_to_window():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    vllm_config.model_config.hf_config.compress_ratios = [0, 0, 4, 128]
+    kv_cache_config = make_kv_cache_config(block_size=block_size)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    request = create_request(num_tokens=130, do_remote_prefill=True)
+
+    count, async_load = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert count == 128
+    assert async_load is True
+
+
+@pytest.mark.cpu_test
+def test_get_num_new_matched_tokens_uses_smallest_safe_compressed_window():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    vllm_config.model_config.hf_config.compress_ratios = [0, 0, 4, 128]
+    kv_cache_config = make_kv_cache_config(block_size=block_size)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    request = create_request(num_tokens=18, do_remote_prefill=True)
+
+    count, async_load = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert count == 16
+    assert async_load is True
+
+
+@pytest.mark.cpu_test
+def test_process_pulling_result_skips_finished_recving_for_empty_pull():
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker.xfer_debug_config = None
+    worker.finished_recving_reqs = set()
+
+    pull_meta = PullReqMeta(
+        d_req_id="d-req",
+        transfer_id="transfer",
+        local_block_ids=[],
+        remote_engine_id="engine",
+        remote_bootstrap_addr="addr",
+        pull_tasks_count=1,
+    )
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        ok_reqs=["d-req"],
+    )
+
+    worker.process_pulling_result(response, {"d-req": pull_meta})
+
+    assert pull_meta.pull_tasks_count == 0
+    assert worker.finished_recving_reqs == set()
+
+
+@pytest.mark.cpu_test
+def test_process_pulling_result_marks_finished_recving_for_non_empty_pull():
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker.xfer_debug_config = None
+    worker.finished_recving_reqs = set()
+
+    pull_meta = PullReqMeta(
+        d_req_id="d-req",
+        transfer_id="transfer",
+        local_block_ids=[[1]],
+        remote_engine_id="engine",
+        remote_bootstrap_addr="addr",
+        pull_tasks_count=1,
+    )
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        ok_reqs=["d-req"],
+    )
+
+    worker.process_pulling_result(response, {"d-req": pull_meta})
+
+    assert pull_meta.pull_tasks_count == 0
+    assert worker.finished_recving_reqs == {"d-req"}
+
+
+@pytest.mark.cpu_test
+def test_get_num_new_matched_tokens_keeps_full_prompt_for_regular_models():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+    )
+    kv_cache_config = make_kv_cache_config(block_size=block_size)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    request = create_request(num_tokens=17, do_remote_prefill=True)
+
+    count, async_load = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert count == 17
+    assert async_load is True
+
+
 # ---------------------------------------------------------------------------
 #  test_metadata_hma_block_ids: MooncakeConnectorMetadata stores per-group IDs
 # ---------------------------------------------------------------------------
@@ -214,7 +446,7 @@ def test_metadata_hma_block_ids():
     ".mooncake_connector.TransferEngine",
     FakeMooncakeWrapper,
 )
-async def test_build_transfer_params_multi_group_trimming(monkeypatch):
+async def test_build_transfer_params_multi_group_trimming(monkeypatch, tmp_path: Path):
     """_build_transfer_params trims per-group blocks when local > remote."""
 
     monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
@@ -277,6 +509,7 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
             lengths,
             err_reqs,
             err_msg,
+            debug_descriptors,
         ) = await worker._build_transfer_params(
             ready_reqs, xfer_meta, local_regions, remote_regions
         )
@@ -289,6 +522,31 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
         assert len(src_ptrs) > 0
         assert len(dst_ptrs) == len(src_ptrs)
         assert len(lengths) == len(src_ptrs)
+        assert debug_descriptors == []
+
+        worker.xfer_debug_config = XferDebugConfig(dump_dir=tmp_path)
+        (
+            debug_src_ptrs,
+            debug_dst_ptrs,
+            debug_lengths,
+            debug_err_reqs,
+            debug_err_msg,
+            debug_descriptors,
+        ) = await worker._build_transfer_params(
+            ready_reqs, xfer_meta, local_regions, remote_regions
+        )
+
+        assert debug_err_reqs == []
+        assert debug_err_msg is None
+        assert debug_src_ptrs == src_ptrs
+        assert debug_dst_ptrs == dst_ptrs
+        assert debug_lengths == lengths
+        assert len(debug_descriptors) == len(src_ptrs)
+        assert debug_descriptors[0].transfer_id == transfer_id
+        assert debug_descriptors[0].d_req_id == "d-trim"
+        assert debug_descriptors[0].region_idx == 0
+        assert debug_descriptors[0].source_block_len == block_len
+        assert debug_descriptors[0].target_block_len == block_len
 
         worker.shutdown()
 
@@ -360,6 +618,7 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
             lengths,
             err_reqs,
             err_msg,
+            debug_descriptors,
         ) = await worker._build_transfer_params(
             ready_reqs, xfer_meta, local_regions, remote_regions
         )
@@ -370,6 +629,7 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
         assert src_ptrs == []
         assert dst_ptrs == []
         assert lengths == []
+        assert debug_descriptors == []
 
         worker.shutdown()
 
