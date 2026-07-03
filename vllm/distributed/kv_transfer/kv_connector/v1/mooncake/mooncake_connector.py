@@ -683,6 +683,7 @@ class MooncakeConnectorScheduler:
             self._get_group_transfer_info(group)
             for group in kv_cache_config.kv_cache_groups
         ]
+        self.use_compress = self._model_uses_compress()
         self.blocks_per_sw = [
             group_info.blocks_per_window for group_info in self.group_transfer_info
         ]
@@ -713,6 +714,11 @@ class MooncakeConnectorScheduler:
                 specs.append(layer_spec)
         return specs or [group_spec]
 
+    def _model_uses_compress(self) -> bool:
+        hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+        compress_ratios = getattr(hf_config, "compress_ratios", None)
+        return isinstance(compress_ratios, (list, tuple, dict))
+
     def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
         specs = self._get_group_unique_specs(group)
         first_spec = specs[0] if specs else group.kv_cache_spec
@@ -724,21 +730,13 @@ class MooncakeConnectorScheduler:
         if block_size <= 0:
             block_size = self.block_size
 
-        compress_ratios = [
-            max(1, int(compress_ratio))
-            for spec in specs
-            if (compress_ratio := getattr(spec, "compress_ratio", 1)) is not None
-        ]
-        compressed_ratios = [ratio for ratio in compress_ratios if ratio > 1]
-        group_min_compress_ratio = min(compressed_ratios) if compressed_ratios else 1
-
         sliding_window = 0
         for spec in specs:
             if isinstance(spec, SlidingWindowSpec):
                 sliding_window = max(sliding_window, spec.sliding_window)
 
         return GroupTransferInfo(
-            tokens_per_block=block_size * group_min_compress_ratio,
+            tokens_per_block=block_size,
             blocks_per_window=cdiv(sliding_window, block_size) + 1
             if sliding_window
             else 0,
@@ -752,6 +750,11 @@ class MooncakeConnectorScheduler:
         spec = self.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
         group_block_size = getattr(spec, "block_size", self.block_size)
         return group_block_size if group_block_size > 0 else self.block_size
+
+    def _state_prefill_token_count(self, num_prompt_tokens: int) -> int:
+        if self.use_compress and num_prompt_tokens > 1:
+            return num_prompt_tokens - 1
+        return num_prompt_tokens
 
     def _clip_blocks_to_external_tokens(
         self,
@@ -800,7 +803,8 @@ class MooncakeConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             assert not self.is_kv_producer
             token_ids = request.prompt_token_ids or []
-            count = len(token_ids) - num_computed_tokens
+            external_token_count = self._state_prefill_token_count(len(token_ids))
+            count = max(external_token_count - num_computed_tokens, 0)
             if count > 0:
                 return count, True
 
