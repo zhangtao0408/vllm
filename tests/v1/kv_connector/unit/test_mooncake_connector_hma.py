@@ -315,6 +315,75 @@ def test_get_num_new_matched_tokens_uses_smallest_safe_compressed_window():
 
 
 @pytest.mark.cpu_test
+def test_get_num_new_matched_tokens_truncates_compressed_prefill_producer_once():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        block_size=block_size,
+    )
+    vllm_config.model_config.hf_config.compress_ratios = [0, 0, 4, 128]
+    kv_cache_config = make_kv_cache_config(block_size=block_size)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    request = create_request(num_tokens=129, do_remote_decode=True)
+
+    count, async_load = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+    count_again, async_load_again = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert count == 0
+    assert async_load is False
+    assert count_again == 0
+    assert async_load_again is False
+    assert request.num_prompt_tokens == 128
+    assert len(request.prompt_token_ids or []) == 128
+    assert len(request._all_token_ids) == 128
+    assert request.max_tokens == 1
+    assert request.kv_transfer_params is not None
+    assert request.kv_transfer_params["_p_side_truncated"] is True
+
+
+@pytest.mark.cpu_test
+def test_get_num_new_matched_tokens_truncates_producer_to_compressed_window():
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        block_size=block_size,
+    )
+    vllm_config.model_config.hf_config.compress_ratios = [0, 0, 4, 128]
+    kv_cache_config = make_kv_cache_config(block_size=block_size)
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+    request = create_request(num_tokens=130, do_remote_decode=True)
+
+    count, async_load = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert count == 0
+    assert async_load is False
+    assert request.num_prompt_tokens == 128
+    assert len(request.prompt_token_ids or []) == 128
+    assert len(request._all_token_ids) == 128
+    assert request.max_tokens == 1
+    assert request.kv_transfer_params is not None
+    assert request.kv_transfer_params["_p_side_truncated"] is True
+
+
+@pytest.mark.cpu_test
 def test_process_pulling_result_skips_finished_recving_for_empty_pull():
     worker = object.__new__(MooncakeConnectorWorker)
     worker.xfer_debug_config = None
